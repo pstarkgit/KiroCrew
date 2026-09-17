@@ -3430,6 +3430,11 @@ async def _persist_handover_tail(state: DashboardState, name: str, slot: _ChatSl
     reach these rows again, so a caller that discards the answer reports a close
     that succeeded while the rows became unreachable. The log line names the exact
     count for the same reason.
+
+    A queued prompt the hand-over line could not carry is reported, not returned:
+    the answer is about ROWS, and every caller reads False as "the transcript
+    write failed". A committed write that deferred the queue is a different fact,
+    and the log is where it belongs.
     """
     try:
         slot.flush_deferred_notes()
@@ -3453,7 +3458,12 @@ async def _persist_handover_tail(state: DashboardState, name: str, slot: _ChatSl
     # covers the other shape of unsaved state: an in-place edit to a row already
     # persisted leaves the length unchanged.
     unsaved = max(0, len(slot.messages) - slot._disk_window_len)
-    if not unsaved and not slot._dirty:
+    # A queued prompt is unsaved state that changes NEITHER of those: its row is
+    # written by the drain, so the window length is unchanged, and an enqueue does
+    # not dirty the slot. Returning True here on that state would report a clean
+    # hand-over while the prompt's only copy goes with the discarded object.
+    owed_prompts = len(slot.durable_queue_entries())
+    if not unsaved and not slot._dirty and not slot.queue_persist_pending:
         return True
     history_key = slot_history_key(slot)
     try:
@@ -3488,6 +3498,27 @@ async def _persist_handover_tail(state: DashboardState, name: str, slot: _ChatSl
             history_key,
         )
         return False
+    if owed_prompts and slot.queue_persist_pending:
+        # The write committed, and it still did not carry these entries: a
+        # rows-only save over a line another live slot published defers every
+        # slot-owned field, ``queued_prompts`` among them (``queue_line_is_ours``
+        # keeps them owed rather than falsely credited). Nothing in this process
+        # will visit this slot again, so say so with the count — the same
+        # obligation the held-note arm above carries, and for the same reason:
+        # these are the user's own words and this frame is their last reader.
+        #
+        # Carrying them instead would mean making ``queued_prompts`` a merge
+        # field on the rows-only path, which is a change to what a durable
+        # metadata line MEANS for a key two slots share, not a loop-side
+        # ordering fix. Left out deliberately; the report is the remedy here.
+        logger.warning(
+            "Slot %s: %d queued prompt(s) were not carried by the hand-over write to "
+            "%s (the line belongs to the replacement holding this key); they are lost "
+            "with the original slot",
+            name,
+            owed_prompts,
+            history_key,
+        )
     return True
 
 

@@ -49,6 +49,10 @@ from kiro_crew.dashboard.slot_buffers import (
     serialize_deferred_notes,
     union_deferred_notes,
 )
+from kiro_crew.dashboard.slot_queue_repository import (
+    queue_persist_signature,
+    sanitize_restored_queue,
+)
 from kiro_crew.dashboard.state import (
     _TRANSIENT_ROLES,
     DashboardState,
@@ -158,6 +162,29 @@ _MAX_HISTORY_CHARS = 8000
 # event-loop mutations. A handful suffices — the only racing mutation is the
 # rare >10000-message trim; retries just re-read until the two reads agree.
 _FLUSH_SNAPSHOT_RETRIES = 4
+
+
+def _stable_durable_queue(slot: _ChatSlot) -> tuple[list[dict], int]:
+    """One self-consistent read of *slot*'s durable queue value and its count.
+
+    ``durable_queue_entries`` builds its list entry by entry, so a drain landing
+    mid-build could hand back a value the queue never held. Read it twice and
+    keep going while the two disagree; the last read is returned when the budget
+    is spent, because a self-consistent value is a best effort here, not a
+    precondition — the caller-supplied-window path cannot prove its pairing with
+    the queue in the first place (see ``expected_disk_older_count``).
+
+    The candidate count rides along because the save SUBTRACTS the two to report
+    an over-cap queue, and that difference is only true of one observation.
+    """
+    entries, candidates = slot.durable_queue_view()
+    for _ in range(_FLUSH_SNAPSHOT_RETRIES):
+        again, again_candidates = slot.durable_queue_view()
+        if again == entries:
+            return entries, candidates
+        entries, candidates = again, again_candidates
+    return entries, candidates
+
 
 # Fallback effort levels — used when no ACP session has reported its config
 # yet (cold start). Sourced from the shared ``effort.py`` vocabulary so every
@@ -1259,6 +1286,18 @@ def _rehydrate_slot_from_history(
             # the filter is pure and scans that in-memory window, never the
             # transcript file (this function runs on the event loop).
             slot._deferred_notes = restored_notes
+        _restored_queue = sanitize_restored_queue(meta.get("queued_prompts"))
+        if _restored_queue:
+            # Hand the queued prompts back as queue cards. They are the user's
+            # own words, admitted while a turn was running and never dispatched,
+            # so before this they simply vanished on a restart with no row and no
+            # error. Nothing drains an idle slot on boot, so they wait for the
+            # user to send, edit or delete them rather than running unasked.
+            slot._queue[:] = _restored_queue
+            logger.info("Restored %d queued prompt(s) for slot %s", len(_restored_queue), slot_name)
+        # Stamped whatever was restored (including nothing), so the first flush
+        # after a restart re-persists only a queue that actually changed.
+        slot._queue_persisted_sig = queue_persist_signature(slot.durable_queue_entries())
         mm = meta.get("memory_mode", "persistent")
         slot.memory_mode = mm
         if mm != "persistent":
@@ -1819,6 +1858,12 @@ def _apply_recent_session(
         # pure scan of the already-prefetched messages; no file I/O here,
         # this apply half runs on the event loop).
         slot._deferred_notes = restored_notes
+    _restored_queue = sanitize_restored_queue(meta.get("queued_prompts"))
+    if _restored_queue:
+        # Mirror of the hand-back in _rehydrate_slot_from_history.
+        slot._queue[:] = _restored_queue
+        logger.info("Restored %d queued prompt(s) for slot %s", len(_restored_queue), slot_name)
+    slot._queue_persisted_sig = queue_persist_signature(slot.durable_queue_entries())
     mm = meta.get("memory_mode", "persistent")
     slot.memory_mode = mm
     if mm != "persistent":
@@ -3014,8 +3059,24 @@ def _save_slot_to_history(
     # and so cannot be acquired from this thread). An explicit snapshot is
     # internally consistent by construction, but its PAIRING with the frozen
     # prefix boundary is not -- see ``expected_disk_older_count`` above.
+    #
+    # The QUEUE is snapshotted in the same stretch, and for the same reason at a
+    # different boundary: the drain pops an entry and appends its user row in
+    # one event-loop step, so the two halves only ever agree in a pair taken
+    # while no drain ran between them. Reading the queue separately from the
+    # window is what lets a file commit BOTH halves missing -- window frozen
+    # before the drain, queue read after it -- which is the prompt disappearing
+    # with no row, the exact loss this key exists to prevent. The pair is
+    # therefore proven, not assumed: read the queue, snapshot the window, read
+    # the queue again, and retry while the two queue reads disagree.
     if messages is not None:
         window = list(messages)
+        # A caller-supplied window was frozen before this call, so this function
+        # cannot prove ITS pairing with the queue -- the same limitation the
+        # frozen-prefix boundary has here, which is why callers that freeze
+        # across an await pass ``expected_disk_older_count``. Take the queue as
+        # a self-consistent value and let the caller own the pairing.
+        queue_snapshot, queue_candidates = _stable_durable_queue(slot)
         disk_older = slot._disk_older_count
         if expected_disk_older_count is not None and disk_older != expected_disk_older_count:
             # The window hit the cap and trimmed while this save was in flight,
@@ -3034,12 +3095,28 @@ def _save_slot_to_history(
     else:
         for _ in range(_FLUSH_SNAPSHOT_RETRIES):
             disk_older = slot._disk_older_count
+            queue_snapshot, queue_candidates = slot.durable_queue_view()
             window = list(slot.messages)
-            if slot._disk_older_count == disk_older:
+            if (
+                slot._disk_older_count == disk_older
+                and slot.durable_queue_entries() == queue_snapshot
+            ):
                 break
         else:
             disk_older = slot._disk_older_count
+            queue_snapshot, queue_candidates = slot.durable_queue_view()
             window = list(slot.messages)
+            if slot.durable_queue_entries() != queue_snapshot:
+                # The pair could not be proven inside the retry budget. Refuse
+                # rather than commit a file that may show neither the entry nor
+                # its row: nothing is written, the queue stays owed by the drift
+                # check, and the next flush pass re-decides against the state
+                # that actually exists.
+                logger.warning(
+                    "Slot %s save refused: the queue moved during every window snapshot",
+                    slot.key,
+                )
+                return False
     # Filter the SNAPSHOT, never slot.messages: this may run in the flush
     # executor thread, where mutating the live window is exactly the race the
     # snapshot above exists to avoid. A note row whose slot was rebound after
@@ -3161,6 +3238,14 @@ def _save_slot_to_history(
                     "color_theme": slot.color_theme or "",
                     "memory_mode": slot.memory_mode,
                     "model": slot.model,
+                    # CLEARABLE: the queued prompts a restore hands back. Written
+                    # even when empty, so a drain that emptied the queue is not
+                    # left with the pre-drain set on disk (the merge cannot
+                    # delete a key, and the restore treats a falsy value as an
+                    # empty queue). The value is the snapshot taken WITH the
+                    # window, never a fresh read: a re-read here would be a
+                    # second, unpaired observation of the queue.
+                    "queued_prompts": queue_snapshot,
                     # None means "follow the global threshold" and is the
                     # cleared value (rehydrate reads it with ``is not None``),
                     # so the override is CLEARABLE: written even when None,
@@ -3301,6 +3386,15 @@ def _save_slot_to_history(
                 raise OSError(
                     f"empty-window metadata merge skipped: record unreadable for {history_key}"
                 )
+            if applied and slot_history_key(slot) == history_key:
+                # The queued prompts this merge committed are now durable, so
+                # the flush's drift check must stop reporting them as owed. Same
+                # routing guard as the full save's witnesses: a slot rebound
+                # while the merge was in flight would otherwise be credited for
+                # a value written to the OLD transcript.
+                _merged_queue = merged_fields.get("queued_prompts")
+                if isinstance(_merged_queue, list):
+                    slot._queue_persisted_sig = queue_persist_signature(_merged_queue)
         return True
     # Skip a pure no-op: a freshly resumed slot with no new AND no edited
     # messages. ``slot._dirty`` is set by both append and in-place edits
@@ -3312,6 +3406,10 @@ def _save_slot_to_history(
         slot._resumed_count > 0
         and len(window) <= slot._resumed_count
         and not slot._dirty
+        # A queued prompt lives on the metadata line, so a slot whose window has
+        # not grown since resume can still owe one. Skipping here would leave
+        # that prompt with no durable copy for as long as the slot stays quiet.
+        and not slot.queue_persist_pending
         and not closed
         and not force
         and not rewrite
@@ -3631,6 +3729,43 @@ def _save_slot_to_history(
             ]
             if surviving_hold:
                 meta_line["deferred_notes"] = surviving_hold
+            # Durable copy of the queued user prompts. OWNED, and the whole
+            # value is decided here, so an emptied queue is cleared by absence.
+            #
+            # Correctness rests on ONE property of this save: the message window
+            # and this queue value are ONE paired observation (see the snapshot
+            # block above), and they land in a single atomic file replace. The
+            # drain removes an entry from ``_queue`` and appends its user row in
+            # the same event-loop step, so a pair taken with no drain between its
+            # two halves shows them agreeing — either the entry is queued and its
+            # row is not there, or the row is there and the entry is gone. A
+            # crash between the drain and this save loses the row too, so the
+            # replayed entry is a prompt the transcript never recorded, never a
+            # second copy of one it did.
+            #
+            # Restored entries are handed back as QUEUE CARDS, not dispatched:
+            # nothing drains an idle slot on boot. That is deliberate — an
+            # indeterminate send must never be auto-resent (sendTurn.ts), and a
+            # prompt whose turn may have run un-persisted is exactly that case.
+            _durable_queue = queue_snapshot
+            if _durable_queue:
+                meta_line["queued_prompts"] = _durable_queue
+            # Both halves of this subtraction come from the SAME queue read (see
+            # ``durable_queue_view``). Counting the live queue here instead would
+            # report a prompt that merely arrived after the snapshot as one the
+            # bounds refused, which is a different fact than the one measured.
+            _queue_shortfall = queue_candidates - len(_durable_queue)
+            if _queue_shortfall > 0:
+                # Named here, once per save, so an over-cap queue is a visible
+                # operational fact rather than a silent omission. The send is not
+                # refused for it: see ``durable_queue_view``.
+                logger.warning(
+                    "Slot %s: %d queued prompt(s) exceed the durable queue "
+                    "bounds and are not persisted; %d carried",
+                    slot.key,
+                    _queue_shortfall,
+                    len(_durable_queue),
+                )
             # The drop records this write retires are CONSUMED only after the
             # atomic_write below commits (and never on the rows-only path,
             # which defers the key to the on-disk value): a dropped note's row
@@ -3707,6 +3842,11 @@ def _save_slot_to_history(
             # rewrites them, so that loss is permanent.
             own_tab_id = getattr(slot, "_tab_id", "") or ""
             line_is_this_slots = bool(own_tab_id) and existing_meta.get("tab_id") == own_tab_id
+            # Whether the line this save writes carries THIS slot's queue. A
+            # deferring rows-only write carries the live holder's value instead,
+            # so the popped slot must not be credited with having persisted its
+            # own queue — its entries stay owed, which is the conservative side.
+            queue_line_is_ours = not (rows_only and existing_meta and not line_is_this_slots)
             if rows_only and existing_meta and not line_is_this_slots:
                 # A rows-only write does not own the slot-owned fields: the line
                 # describes whichever OTHER live slot published it, and this one is
@@ -3930,6 +4070,11 @@ def _save_slot_to_history(
                 # has no ``created_at`` for the identity string above.
                 slot._disk_meta_observed = True
                 slot._frozen_prefix_cache = _post_write_cache
+                if queue_line_is_ours:
+                    # The queued prompts are now on disk, so the flush's drift
+                    # check stops reporting them as owed until the queue moves
+                    # again.
+                    slot._queue_persisted_sig = queue_persist_signature(_durable_queue)
             else:
                 logger.warning(
                     "Slot %s was rebound from %s while its save was in flight; "
