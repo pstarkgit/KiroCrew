@@ -173,6 +173,30 @@ describe('untranslated-english — a Latin-script value must not read as English
   })
 })
 
+describe('TODO(i18n) — an explicitly marked pending-translation placeholder', () => {
+  const MARKED = 'TODO(i18n): This starts a request you finish in a terminal on this machine — nothing is delivered until then, and you can withdraw it at any time.'
+
+  it('is accepted verbatim in every non-Latin locale', () => {
+    for (const lang of Object.keys(TARGET_SCRIPTS)) {
+      expect(flagsScript(MARKED, lang), lang).toBe(false)
+    }
+  })
+
+  it('is accepted verbatim in every Latin-script locale', () => {
+    for (const lang of Object.keys(FUNCTION_WORDS)) {
+      expect(flagsEnglish(MARKED, lang, MARKED), lang).toBe(false)
+    }
+  })
+
+  it('exempts ONLY the marked value — the same English without the marker still fails', () => {
+    // The marker is load-bearing: strip it and the identical prose reddens, so
+    // the exemption cannot silently swallow ordinary untranslated English.
+    const unmarked = MARKED.slice('TODO(i18n): '.length)
+    expect(flagsScript(unmarked, 'ja')).toBe(true)
+    expect(flagsEnglish(unmarked, 'de', unmarked)).toBe(true)
+  })
+})
+
 describe('stripping', () => {
   it('removes every locale-invariant span before anything is judged', () => {
     expect(strippedProse('Open {{name}} at https://x.dev/a/b using `npm ci` v2')).toBe('Open at using v')

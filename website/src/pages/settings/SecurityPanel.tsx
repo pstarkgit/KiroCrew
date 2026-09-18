@@ -944,8 +944,16 @@ function FileDeliveryConsentCard() {
   const [wasArmed, setWasArmed] = useState(false)
   const anyArmed = !!armedView?.armed
   useEffect(() => {
-    if (anyArmed) setWasArmed(true)
-  }, [anyArmed])
+    if (anyArmed) {
+      setWasArmed(true)
+      return
+    }
+    if (wasArmed) {
+      // Host approval or expiry ends arm polling. Re-read the grant before
+      // rendering the terminal state, or a completed approval looks expired.
+      void qc.invalidateQueries({ queryKey: ['file-delivery-consent'] })
+    }
+  }, [anyArmed, qc, wasArmed])
 
   const excluded = view?.never_grantable ?? []
   const busy = isLoading || arm.isPending || withdraw.isPending

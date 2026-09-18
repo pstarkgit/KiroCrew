@@ -180,6 +180,31 @@ describe('SecurityPanel - flagged-file delivery consent', () => {
     )
   })
 
+  it('re-reads the grant when host approval ends an armed request', async () => {
+    // Armed first, then the host approval lands: the arm poll flips to
+    // {armed:false} and STOPS, so the terminal render must come from a fresh
+    // consent GET, not the stale pre-arm cache (or a completed approval reads as
+    // expired). Start armed and grant-less; after the poll flips to not-armed
+    // the grant read returns a live grant, and the row must show Allowed.
+    ;(api.fileDeliveryConsent as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce(consent())
+      .mockResolvedValue(consent({ grants: { [OWNER]: { destination_class: OWNER, granted_at: GRANTED_AT } } }))
+    ;(api.fileDeliveryConsentArmStatus as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({
+        ok: true, armed: true, request_id: 'req-1', destination_class: OWNER,
+        expires_in: 600, approve_command: 'kirocrew file-delivery approve',
+      })
+      .mockResolvedValue(NOT_ARMED)
+
+    renderWithProviders(<SecurityPanel />, { route: '/?section=delivery' })
+    await screen.findByTestId(`file-delivery-armed-${OWNER}`)
+
+    // The armed→not-armed transition invalidates the grant query; the refetch
+    // returns the live grant, so the row settles on Allowed with a Withdraw.
+    expect(await screen.findByText('Allowed', {}, { timeout: 10000 })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Withdraw' })).toBeInTheDocument()
+  })
+
   it('allowed: shows the grant time and a Withdraw control that revokes that class', async () => {
     await renderDelivery(consent({ grants: { [OWNER]: { destination_class: OWNER, granted_at: GRANTED_AT } } }))
 
@@ -187,6 +212,7 @@ describe('SecurityPanel - flagged-file delivery consent', () => {
     expect(within(row).getByText('Allowed')).toBeInTheDocument()
     // The timestamp is rendered through the locale-aware formatter, so assert the
     // YEAR is present rather than a hardcoded format string.
+
     expect(within(row).getByText(/Since .*2026/)).toBeInTheDocument()
 
     fireEvent.click(within(row).getByRole('button', { name: 'Withdraw' }))

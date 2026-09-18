@@ -576,17 +576,17 @@ class TestGrantRequiresAHostStepUp:
         # what removes it).
         a = file_delivery_consent.arm_grant(file_delivery_consent.CLASS_OWNER_DASHBOARD)
         real_time = file_delivery_consent.time.time
-        monkeypatch.setattr(
-            file_delivery_consent.time,
-            "time",
-            lambda: real_time() + file_delivery_consent.GRANT_PENDING_TTL_SECS + 1,
-            raising=True,
-        )
-        assert file_delivery_consent.read_pending_grant() is None
-        assert file_delivery_consent.pending_grant_path().exists() is True
+        with pytest.MonkeyPatch.context() as clock:
+            clock.setattr(
+                file_delivery_consent.time,
+                "time",
+                lambda: real_time() + file_delivery_consent.GRANT_PENDING_TTL_SECS + 1,
+                raising=True,
+            )
+            assert file_delivery_consent.read_pending_grant() is None
+            assert file_delivery_consent.pending_grant_path().exists() is True
         assert a.request_id  # the armed request existed before it expired
         # And a fresh arm replaces the expired file with a live request.
-        monkeypatch.undo()
         b = file_delivery_consent.arm_grant(file_delivery_consent.CLASS_OWNER_DASHBOARD)
         live = file_delivery_consent.read_pending_grant()
         assert live is not None
