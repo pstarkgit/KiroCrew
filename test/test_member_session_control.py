@@ -39,12 +39,217 @@ from kiro_crew.members import DM_SLOT_KEY_PREFIX
 
 class TestMemberCallerPredicate:
     def test_member_slot_key_is_a_member_caller(self):
-        assert sc._member_caller(DM_SLOT_KEY_PREFIX + "radar")
+        member = DM_SLOT_KEY_PREFIX + "radar"
+        state = _State({member: _slot(member)})
+        assert sc._member_caller(state, member)
 
     def test_ordinary_and_unattended_slots_are_not(self):
-        assert not sc._member_caller("chat-1-abc")
-        assert not sc._member_caller("cron-xyz")
-        assert not sc._member_caller("")
+        state = _State(
+            {
+                "chat-1-abc": _slot("chat-1-abc"),
+                "cron-xyz": _slot("cron-xyz"),
+            }
+        )
+        assert not sc._member_caller(state, "chat-1-abc")
+        assert not sc._member_caller(state, "cron-xyz")
+        assert not sc._member_caller(state, "")
+
+    def test_chat_slot_bound_to_a_member_v2_store_is_a_member_caller(self, monkeypatch):
+        # Case (b): the conductor's ORDINARY chat slot, whose bound memory store
+        # is a crew member's private V2 store. The identity here is the STORE,
+        # not the `member-` key prefix — so a plain `chat-` key still resolves
+        # as a member caller.
+        chat = _slot("chat-10-1789623359")
+        chat.memory_store = "member-kirocrew-conductor-deadbeef"
+        state = _State({chat.key: chat})
+        monkeypatch.setattr(sc, "_store_is_member_owned", lambda store: store.startswith("member-"))
+        assert sc._member_caller(state, chat.key)
+
+    def test_chat_slot_bound_to_a_non_member_store_is_not(self, monkeypatch):
+        # A chat slot whose store is NOT a crew member's V2 store stays an
+        # ordinary caller — the admission never widens past member stores.
+        chat = _slot("chat-10-1789623359")
+        chat.memory_store = "default"
+        state = _State({chat.key: chat})
+        monkeypatch.setattr(sc, "_store_is_member_owned", lambda store: False)
+        assert not sc._member_caller(state, chat.key)
+
+
+class TestStoreIsMemberOwned:
+    """The shared config-record predicate the gate and the inner fence agree on.
+
+    A store is a crew member's store iff its config record carries a non-empty
+    ``owner_member`` AND ``memory_version == 2`` — read from the loaded config,
+    never the on-disk manifest (that would be blocking IO at the sync fence).
+    Fails CLOSED on an unreadable or degraded ``memory_stores`` section.
+    """
+
+    def _cfg(self, stores, *, degraded=frozenset(), agents=None):
+        # By default, synthesize an active agent bound to each owned V2 store, so
+        # the owner is the store's exclusive active binding — the live-binding
+        # test `_member_store_verdict` applies for `_STORE_MEMBER`. Pass `agents`
+        # to model a retired/re-bound owner (a deleted crew leaves no agent).
+        if agents is None:
+            agents = {
+                getattr(rec, "owner_member", ""): SimpleNamespace(memory_store=name)
+                for name, rec in stores.items()
+                if getattr(rec, "owner_member", "") and getattr(rec, "memory_version", 1) == 2
+            }
+        return SimpleNamespace(memory_stores=stores, degraded_sections=degraded, agents=agents)
+
+    def test_member_owned_v2_store_is_true(self):
+        stores = {"member-radar-abc": SimpleNamespace(owner_member="radar", memory_version=2)}
+        with patch.object(sc.KiroCrewConfig, "load", return_value=self._cfg(stores)):
+            assert sc._store_is_member_owned("member-radar-abc") is True
+
+    def test_default_and_empty_are_false_without_reading_config(self):
+        # Short-circuited before load(): the global store is never a member store.
+        with patch.object(sc.KiroCrewConfig, "load", side_effect=AssertionError("loaded")):
+            assert sc._store_is_member_owned("") is False
+            assert sc._store_is_member_owned("default") is False
+
+    def test_v1_or_unowned_store_is_false(self):
+        stores = {
+            "legacy": SimpleNamespace(owner_member="", memory_version=1),
+            "ownerless-v2": SimpleNamespace(owner_member="", memory_version=2),
+            "owned-v1": SimpleNamespace(owner_member="radar", memory_version=1),
+        }
+        with patch.object(sc.KiroCrewConfig, "load", return_value=self._cfg(stores)):
+            assert sc._store_is_member_owned("legacy") is False
+            assert sc._store_is_member_owned("ownerless-v2") is False
+            assert sc._store_is_member_owned("owned-v1") is False
+
+    def test_unknown_store_is_false(self):
+        with patch.object(sc.KiroCrewConfig, "load", return_value=self._cfg({})):
+            assert sc._store_is_member_owned("member-ghost-abc") is False
+
+    def test_fails_closed_on_config_read_error(self):
+        with patch.object(sc.KiroCrewConfig, "load", side_effect=RuntimeError("boom")):
+            assert sc._store_is_member_owned("member-radar-abc") is False
+
+    def test_fails_closed_on_degraded_memory_stores_section(self):
+        stores = {"member-radar-abc": SimpleNamespace(owner_member="radar", memory_version=2)}
+        for degraded in ("memory_stores", sc.DEGRADED_WHOLE_CONFIG):
+            cfg = self._cfg(stores, degraded=frozenset({degraded}))
+            with patch.object(sc.KiroCrewConfig, "load", return_value=cfg):
+                assert sc._store_is_member_owned("member-radar-abc") is False, degraded
+
+
+class TestMemberStoreVerdict:
+    """The FOUR-valued classification the boolean wrapper and the fence share.
+
+    ``_member_store_verdict`` distinguishes a definitive ``non_member`` (the
+    record says the store is not a private V2 store — e.g. a legacy V1 named
+    store) from ``private_v2_nonmember`` (a V2 store with no live member owner)
+    and from ``unknown`` (the config read could not answer). The member ADMISSION
+    collapses all of those to "not a member" (fail closed), but the FENCE binds
+    ``member`` / ``private_v2_nonmember`` / ``unknown`` and leaves a definitive
+    ``non_member`` alone — that is what avoids over-narrowing V1 named tabs while
+    still binding a flipped or retired member.
+    """
+
+    def _cfg(self, stores, *, degraded=frozenset(), agents=None):
+        # By default, synthesize an active agent bound to each owned V2 store, so
+        # the owner is the store's exclusive active binding — the live-binding
+        # test `_member_store_verdict` applies for `_STORE_MEMBER`. Pass `agents`
+        # to model a retired/re-bound owner (a deleted crew leaves no agent).
+        if agents is None:
+            agents = {
+                getattr(rec, "owner_member", ""): SimpleNamespace(memory_store=name)
+                for name, rec in stores.items()
+                if getattr(rec, "owner_member", "") and getattr(rec, "memory_version", 1) == 2
+            }
+        return SimpleNamespace(memory_stores=stores, degraded_sections=degraded, agents=agents)
+
+    def test_member_owned_v2_store_is_member(self):
+        stores = {"member-radar-abc": SimpleNamespace(owner_member="radar", memory_version=2)}
+        with patch.object(sc.KiroCrewConfig, "load", return_value=self._cfg(stores)):
+            assert sc._member_store_verdict("member-radar-abc") == sc._STORE_MEMBER
+
+    def test_default_and_empty_are_non_member_without_reading_config(self):
+        with patch.object(sc.KiroCrewConfig, "load", side_effect=AssertionError("loaded")):
+            assert sc._member_store_verdict("") == sc._STORE_NON_MEMBER
+            assert sc._member_store_verdict("default") == sc._STORE_NON_MEMBER
+
+    def test_v1_named_and_unowned_stores(self):
+        # A legacy V1 NAMED store is a DEFINITIVE `non_member` (never fenced). An
+        # ownerless V2 store — what a member store BECOMES when the member is
+        # un-assigned — is `private_v2_nonmember` (still fenced), NOT `non_member`:
+        # that distinction is what keeps a flipped member bounded.
+        stores = {
+            "legacy-v1-named": SimpleNamespace(owner_member="", memory_version=1),
+            "ownerless-v2": SimpleNamespace(owner_member="", memory_version=2),
+            "owned-v1": SimpleNamespace(owner_member="radar", memory_version=1),
+        }
+        with patch.object(sc.KiroCrewConfig, "load", return_value=self._cfg(stores)):
+            assert sc._member_store_verdict("legacy-v1-named") == sc._STORE_NON_MEMBER
+            assert sc._member_store_verdict("owned-v1") == sc._STORE_NON_MEMBER
+            assert sc._member_store_verdict("ownerless-v2") == sc._STORE_PRIVATE_V2_NONMEMBER
+
+    def test_unknown_store_record_is_non_member(self):
+        # The store name has no record: the config answered, and its answer is
+        # "no such member store" — definitive, not undecidable.
+        with patch.object(sc.KiroCrewConfig, "load", return_value=self._cfg({})):
+            assert sc._member_store_verdict("member-ghost-abc") == sc._STORE_NON_MEMBER
+
+    def test_config_read_error_is_unknown(self):
+        with patch.object(sc.KiroCrewConfig, "load", side_effect=RuntimeError("boom")):
+            assert sc._member_store_verdict("some-named-store") == sc._STORE_UNKNOWN
+
+    def test_degraded_memory_stores_section_is_unknown(self):
+        stores = {"member-radar-abc": SimpleNamespace(owner_member="radar", memory_version=2)}
+        for degraded in ("memory_stores", sc.DEGRADED_WHOLE_CONFIG):
+            cfg = self._cfg(stores, degraded=frozenset({degraded}))
+            with patch.object(sc.KiroCrewConfig, "load", return_value=cfg):
+                assert sc._member_store_verdict("member-radar-abc") == sc._STORE_UNKNOWN, degraded
+
+    def test_retired_owner_store_is_private_v2_nonmember_not_member(self):
+        # F1: a crew is DELETED while a chat slot bound to its store is still
+        # live. The store record is RETAINED with `owner_member` still set, but
+        # no agent is bound to it anymore (`cfg.agents` has none). It must NOT
+        # classify `_STORE_MEMBER` — that would hand its live workers the switch
+        # bypass past a disabled `agent.session_control` — but stays a private V2
+        # store, so it is still creator-FENCED.
+        stores = {"member-radar-abc": SimpleNamespace(owner_member="radar", memory_version=2)}
+        cfg = self._cfg(stores, agents={})  # owner agent deleted
+        with patch.object(sc.KiroCrewConfig, "load", return_value=cfg):
+            assert sc._member_store_verdict("member-radar-abc") == sc._STORE_PRIVATE_V2_NONMEMBER
+            assert sc._store_is_member_owned("member-radar-abc") is False
+
+    def test_owner_rebound_to_a_different_store_is_not_member(self):
+        # The owner still exists but is now bound to a DIFFERENT store, so it is
+        # not this store's exclusive active binding: not a member store here.
+        stores = {"member-radar-abc": SimpleNamespace(owner_member="radar", memory_version=2)}
+        agents = {"radar": SimpleNamespace(memory_store="some-other-store")}
+        cfg = self._cfg(stores, agents=agents)
+        with patch.object(sc.KiroCrewConfig, "load", return_value=cfg):
+            assert sc._member_store_verdict("member-radar-abc") == sc._STORE_PRIVATE_V2_NONMEMBER
+
+    def test_owner_actively_bound_is_member(self):
+        # The default `_cfg` binds the owner to its own store: the full live test
+        # passes, so it classifies `_STORE_MEMBER` and grants the bypass.
+        stores = {"member-radar-abc": SimpleNamespace(owner_member="radar", memory_version=2)}
+        with patch.object(sc.KiroCrewConfig, "load", return_value=self._cfg(stores)):
+            assert sc._member_store_verdict("member-radar-abc") == sc._STORE_MEMBER
+            assert sc._store_is_member_owned("member-radar-abc") is True
+
+
+class TestStoreBindingCreatorFences:
+    """The store-binding half of the ownership fence.
+
+    A caller is fenced by its binding when the store is a private V2 store
+    (member OR member-un-assigned) or the lookup could not decide; a definitively
+    non-V2 store (a legacy V1 named store) is NOT fenced.
+    """
+
+    def test_member_and_ownerless_v2_and_unknown_fence(self, monkeypatch):
+        for verdict in (sc._STORE_MEMBER, sc._STORE_PRIVATE_V2_NONMEMBER, sc._STORE_UNKNOWN):
+            monkeypatch.setattr(sc, "_member_store_verdict", lambda store, v=verdict: v)
+            assert sc._store_binding_creator_fences("any") is True, verdict
+
+    def test_definitive_non_member_does_not_fence(self, monkeypatch):
+        monkeypatch.setattr(sc, "_member_store_verdict", lambda store: sc._STORE_NON_MEMBER)
+        assert sc._store_binding_creator_fences("legacy-v1-named") is False
 
 
 def _slot(key: str, *, created_by: str = "", workspace: str = "default") -> SimpleNamespace:
@@ -55,6 +260,7 @@ def _slot(key: str, *, created_by: str = "", workspace: str = "default") -> Simp
         _app="",
         linked_session_key="",
         _created_by=created_by,
+        memory_store="",
         mode="",
         running=False,
         messages=[],
@@ -222,12 +428,13 @@ class TestMemberDispatchCeiling:
 
     def test_bypass_requires_member_and_ceiling_on(self):
         member = DM_SLOT_KEY_PREFIX + "radar"
+        state = _State({member: _slot(member), "chat-1-abc": _slot("chat-1-abc")})
         with patch.object(sc, "member_dispatch_enabled", return_value=True):
-            assert sc._member_bypass(member) is True
-            assert sc._member_bypass("chat-1-abc") is False  # not a member
+            assert sc._member_bypass(state, member) is True
+            assert sc._member_bypass(state, "chat-1-abc") is False  # not a member
         with patch.object(sc, "member_dispatch_enabled", return_value=False):
-            assert sc._member_bypass(member) is False  # ceiling off
-            assert sc._member_bypass("chat-1-abc") is False
+            assert sc._member_bypass(state, member) is False  # ceiling off
+            assert sc._member_bypass(state, "chat-1-abc") is False
 
     def test_member_dispatch_enabled_reads_the_config_field(self):
         cfg = SimpleNamespace(
@@ -797,3 +1004,404 @@ class TestMemberChildPrivateBinding:
         assert state.creator_slot_count(_MEMBER) == 0
         assert published
         assert all(keys == {caller.key} for keys in published)
+
+
+# The conductor's ORDINARY chat slot, bound to its member V2 store — case (b).
+_CONDUCTOR_STORE = "member-kirocrew-conductor-deadbeef"
+_CHAT_CALLER = "chat-10-1789623359"
+
+
+class TestMemberChatSlotCallerFence:
+    """A crew member acting through an ORDINARY chat slot (case (b)).
+
+    A member agent (``kirocrew-conductor``) also runs in a plain dashboard chat
+    slot (key ``chat-<n>-<ts>``) whose bound memory store is that member's
+    private V2 store — its whole operating model (``session_create`` /
+    ``session_send`` / ...) runs from there. Before this change such a slot was
+    refused exactly like any private V2 caller, because the fence keyed only on
+    the ``member-`` KEY prefix. These tests pin that the STORE now grants the
+    same bypass and the same ownership fence a ``member-`` DM slot gets, driven
+    through the real ``authorize_target`` gate order with a fake state.
+
+    ``_store_is_member_owned`` is pinned rather than a config fixture: it has its
+    own record-level unit tests above; here the interest is the fence order.
+    """
+
+    def _chat_caller_slot(self):
+        s = _slot(_CHAT_CALLER)
+        s.memory_store = _CONDUCTOR_STORE
+        return s
+
+    def _member_store(self, monkeypatch):
+        monkeypatch.setattr(sc, "_store_is_member_owned", lambda store: store == _CONDUCTOR_STORE)
+
+    def test_chat_slot_member_controls_its_own_worker_with_switch_off(self, monkeypatch):
+        self._member_store(monkeypatch)
+        worker = _slot("chat-1-w1", created_by=_CHAT_CALLER)
+        state = _State({_CHAT_CALLER: self._chat_caller_slot(), "chat-1-w1": worker})
+        with (
+            patch.object(sc, "caller_slot_key", return_value=_CHAT_CALLER),
+            patch.object(sc, "session_control_enabled", return_value=False),
+            patch.object(sc, "member_dispatch_enabled", return_value=True),
+            patch.object(sc, "_resolve_slot", return_value=worker),
+        ):
+            resolved = sc.authorize_target(
+                state,
+                caller_session_key="dashboard:whatever",
+                target="chat-1-w1",
+                operation="send",
+            )
+        assert resolved is worker
+
+    def test_chat_slot_member_cannot_touch_a_slot_it_did_not_create(self, monkeypatch):
+        # The ownership fence follows the member's AUTHORITY (the store), so a
+        # case-(b) caller is bounded to the workers it created just like a DM
+        # slot — the user's own conversation stays out of reach.
+        self._member_store(monkeypatch)
+        foreign = _slot("chat-1-user", created_by="")
+        state = _State({_CHAT_CALLER: self._chat_caller_slot(), "chat-1-user": foreign})
+        with (
+            patch.object(sc, "caller_slot_key", return_value=_CHAT_CALLER),
+            patch.object(sc, "session_control_enabled", return_value=True),
+            patch.object(sc, "_resolve_slot", return_value=foreign),
+        ):
+            with pytest.raises(sc.SessionControlError) as exc_info:
+                sc.authorize_target(
+                    state,
+                    caller_session_key="dashboard:whatever",
+                    target="chat-1-user",
+                    operation="send",
+                )
+        assert exc_info.value.code == "not_creator"
+        assert "crew member" in exc_info.value.message
+
+    def test_chat_slot_member_falls_back_under_switch_when_ceiling_off(self, monkeypatch):
+        # member_dispatch off withdraws the case-(b) bypass exactly as it does
+        # for a DM slot: with the switch also off, it is refused like an ordinary
+        # caller.
+        self._member_store(monkeypatch)
+        worker = _slot("chat-1-w1", created_by=_CHAT_CALLER)
+        state = _State({_CHAT_CALLER: self._chat_caller_slot(), "chat-1-w1": worker})
+        with (
+            patch.object(sc, "caller_slot_key", return_value=_CHAT_CALLER),
+            patch.object(sc, "session_control_enabled", return_value=False),
+            patch.object(sc, "member_dispatch_enabled", return_value=False),
+            patch.object(sc, "_resolve_slot", return_value=worker),
+        ):
+            with pytest.raises(sc.SessionControlError) as exc_info:
+                sc.authorize_target(
+                    state,
+                    caller_session_key="dashboard:whatever",
+                    target="chat-1-w1",
+                    operation="send",
+                )
+        assert exc_info.value.code == "session_control_disabled"
+
+    def test_non_member_chat_slot_still_needs_the_switch(self, monkeypatch):
+        # A chat slot whose store is NOT a member store is unchanged: no bypass.
+        monkeypatch.setattr(sc, "_store_is_member_owned", lambda store: False)
+        monkeypatch.setattr(sc, "_member_store_verdict", lambda store: sc._STORE_NON_MEMBER)
+        caller = _slot(_CHAT_CALLER)
+        caller.memory_store = "default"
+        state = _State({_CHAT_CALLER: caller, "chat-1-b": _slot("chat-1-b")})
+        with (
+            patch.object(sc, "caller_slot_key", return_value=_CHAT_CALLER),
+            patch.object(sc, "session_control_enabled", return_value=False),
+            patch.object(sc, "member_dispatch_enabled", return_value=True),
+            patch.object(sc, "_resolve_slot", return_value=state._slots["chat-1-b"]),
+        ):
+            with pytest.raises(sc.SessionControlError) as exc_info:
+                sc.authorize_target(
+                    state,
+                    caller_session_key="dashboard:whatever",
+                    target="chat-1-b",
+                    operation="send",
+                )
+        assert exc_info.value.code == "session_control_disabled"
+
+    def test_legacy_v1_named_store_chat_tab_keeps_its_prior_reach(self, monkeypatch):
+        # F2 regression: a plain chat tab bound to a legacy V1 NAMED (non-member)
+        # store. Its private scope resolves to owner (None), so the HTTP gate
+        # admits it with FULL reach, and with `agent.session_control` ON it could
+        # reach same-workspace peers it did not create before this change. The
+        # over-broad fail-safe `if store not in ("", "default"): return True`
+        # silently narrowed it to creator-only. Scoping the fail-safe to an
+        # UNDECIDABLE (`_STORE_UNKNOWN`) verdict restores its reach: a DEFINITIVE
+        # `_STORE_NON_MEMBER` store is NOT fenced, so an ordinary same-workspace
+        # target it did not create is authorized.
+        monkeypatch.setattr(sc, "_member_store_verdict", lambda store: sc._STORE_NON_MEMBER)
+        caller = _slot(_CHAT_CALLER)
+        caller.memory_store = "team-shared-v1"  # a non-default, non-member store
+        peer = _slot("chat-1-peer", created_by="")  # a session the caller did NOT create
+        state = _State({_CHAT_CALLER: caller, "chat-1-peer": peer})
+        # Precondition: this caller is NOT a member (store is definitively non-member).
+        assert not sc._member_caller(state, _CHAT_CALLER)
+        # And it is NOT ownership-fenced: a definitive non-member on a named store
+        # keeps ordinary reach.
+        assert not sc._caller_is_ownership_fenced(state, _CHAT_CALLER)
+        with (
+            patch.object(sc, "caller_slot_key", return_value=_CHAT_CALLER),
+            patch.object(sc, "session_control_enabled", return_value=True),
+            patch.object(sc, "_resolve_slot", return_value=peer),
+        ):
+            resolved = sc.authorize_target(
+                state,
+                caller_session_key="dashboard:whatever",
+                target="chat-1-peer",
+                operation="send",
+            )
+        assert resolved is peer
+
+    def test_degraded_config_cannot_unfence_a_store_bound_caller(self, monkeypatch):
+        # Fail-safe fence: when the caller's store classification is UNDECIDABLE
+        # (`_member_store_verdict` returns `_STORE_UNKNOWN` — a degraded or
+        # unreadable `memory_stores` section), a caller bound to a non-`default`
+        # store stays creator-fenced. That is the ONLY case the fail-safe fences:
+        # an admitted member whose config read failed in an await window must not
+        # reclassify to an ordinary caller and — with the global switch ON — reach
+        # a session it did not create. The store binding keeps it bounded to its
+        # own workers regardless of config health.
+        monkeypatch.setattr(sc, "_member_store_verdict", lambda store: sc._STORE_UNKNOWN)
+        foreign = _slot("chat-1-user", created_by="")
+        state = _State({_CHAT_CALLER: self._chat_caller_slot(), "chat-1-user": foreign})
+        # Precondition: with member-ownership undecidable, the caller is NOT a member.
+        assert not sc._member_caller(state, _CHAT_CALLER)
+        with (
+            patch.object(sc, "caller_slot_key", return_value=_CHAT_CALLER),
+            patch.object(sc, "session_control_enabled", return_value=True),
+            patch.object(sc, "_resolve_slot", return_value=foreign),
+        ):
+            with pytest.raises(sc.SessionControlError) as exc_info:
+                sc.authorize_target(
+                    state,
+                    caller_session_key="dashboard:whatever",
+                    target="chat-1-user",
+                    operation="send",
+                )
+        assert exc_info.value.code == "not_creator"
+
+    def test_member_store_flipped_to_ownerless_v2_mid_await_stays_fenced(self, monkeypatch):
+        # GPT-flagged flip window: a member's chat slot is admitted at the HTTP
+        # gate on its VERIFIED scope, then an operator UN-ASSIGNS the member —
+        # clearing `owner_member` while `memory_version` stays 2, so the store
+        # becomes a `_STORE_PRIVATE_V2_NONMEMBER`. `_member_caller` now reads
+        # False, but the store binding still creator-fences the caller, so a
+        # foreign same-workspace session it did not create stays out of reach even
+        # with the global switch ON. Were the fence to collapse to
+        # `bool(_created_by)` here, this would be a silent cross-session read.
+        monkeypatch.setattr(
+            sc, "_member_store_verdict", lambda store: sc._STORE_PRIVATE_V2_NONMEMBER
+        )
+        foreign = _slot("chat-1-user", created_by="")
+        state = _State({_CHAT_CALLER: self._chat_caller_slot(), "chat-1-user": foreign})
+        # Precondition: after the flip the caller is NOT classified a member...
+        assert not sc._member_caller(state, _CHAT_CALLER)
+        # ...yet its store binding still fences it.
+        assert sc._caller_is_ownership_fenced(state, _CHAT_CALLER)
+        with (
+            patch.object(sc, "caller_slot_key", return_value=_CHAT_CALLER),
+            patch.object(sc, "session_control_enabled", return_value=True),
+            patch.object(sc, "_resolve_slot", return_value=foreign),
+        ):
+            with pytest.raises(sc.SessionControlError) as exc_info:
+                sc.authorize_target(
+                    state,
+                    caller_session_key="dashboard:whatever",
+                    target="chat-1-user",
+                    operation="send",
+                )
+        assert exc_info.value.code == "not_creator"
+
+
+class TestMemberChatSlotCallerEndToEnd:
+    """Case (b) through the REAL create/authorize transaction.
+
+    A plain ``chat-`` slot bound to a member V2 store creates a child, the child
+    is attributed to it and reachable by it, and it is fenced off the user's own
+    sessions — the same contract ``TestMemberDispatchEndToEnd`` pins for a DM
+    slot, now for the chat-slot caller.
+    """
+
+    def _chat_member_tab(self, state):
+        slot = state.get_or_create_slot(_CHAT_CALLER)
+        slot.memory_store = _CONDUCTOR_STORE
+        return slot
+
+    def test_chat_slot_member_creates_and_reaches_its_worker(
+        self, tmp_path, monkeypatch, _fresh_create_budget
+    ):
+        state = _make_state(tmp_path)
+        caller = self._chat_member_tab(state)
+        # Recognise the caller's store as a member store without a config fixture;
+        # keep the child on the default store so the private-binding plumbing
+        # (exercised in TestMemberChildPrivateBinding) stays out of this test.
+        monkeypatch.setattr(sc, "_store_is_member_owned", lambda store: store == _CONDUCTOR_STORE)
+        monkeypatch.setattr(sc, "_workspace_name_for_dir", lambda cfg, ws_dir: caller.workspace)
+        # Switch OFF: the case-(b) member bypass is what admits the create.
+        monkeypatch.setattr(sc, "session_control_enabled", lambda: False)
+        monkeypatch.setattr(sc, "member_dispatch_enabled", lambda: True)
+
+        result = asyncio.run(sc.create_session(state, caller_session_key=slot_history_key(caller)))
+        child = state.get_slot(result["target"])
+        assert child is not None
+        assert child._created_by == _CHAT_CALLER
+        assert child._origin == SlotOrigin.USER
+        for op in ("send", "read", "stop", "close"):
+            resolved = sc.authorize_target(
+                state,
+                caller_session_key=slot_history_key(caller),
+                target=child.key,
+                operation=op,
+            )
+            assert resolved is child, op
+
+    def test_chat_slot_member_cannot_reach_a_session_it_did_not_create(
+        self, tmp_path, monkeypatch, _fresh_create_budget
+    ):
+        state = _make_state(tmp_path)
+        caller = self._chat_member_tab(state)
+        monkeypatch.setattr(sc, "_store_is_member_owned", lambda store: store == _CONDUCTOR_STORE)
+        monkeypatch.setattr(sc, "session_control_enabled", lambda: False)
+        monkeypatch.setattr(sc, "member_dispatch_enabled", lambda: True)
+        state.get_or_create_slot("chat-7", workspace=caller.workspace)
+
+        with pytest.raises(sc.SessionControlError) as exc:
+            sc.authorize_target(
+                state,
+                caller_session_key=slot_history_key(caller),
+                target="chat-7",
+                operation="send",
+            )
+        assert exc.value.code == "not_creator"
+        assert "crew member" in exc.value.message
+
+
+class TestMemberCreatedWorkerCanDispatch:
+    """F3 — the nested-conductor design, stated and pinned.
+
+    A member's created child is bound to the member's own V2 store at birth, so
+    ``_member_caller`` case (b) is true for the WORKER too: a member-created
+    worker is itself member-bound and can dispatch its own children
+    (grandchildren of the original member) under ``agent.member_dispatch``,
+    WITHOUT the global ``session_control`` switch. This is INTENDED — the
+    conductor operating model is recursive, depth-capped by the conductor agent
+    rather than by this fence — and every node stays bounded by the same
+    ownership fence: it reaches only what IT created, never the user's own
+    sessions and never a sibling's. These tests pin that intended behaviour so a
+    future reader does not mistake it for an accidental widening.
+    """
+
+    def test_a_member_bound_worker_is_itself_a_member_caller(self, monkeypatch):
+        # The worker's slot is bound to the member store (as birth-time private
+        # binding leaves it), so case (b) recognises it as a member caller even
+        # though its key is a plain `chat-` key created BY another agent.
+        monkeypatch.setattr(sc, "_store_is_member_owned", lambda store: store == _CONDUCTOR_STORE)
+        worker = _slot("chat-1-w1", created_by=_CHAT_CALLER)
+        worker.memory_store = _CONDUCTOR_STORE
+        state = _State({"chat-1-w1": worker})
+        assert sc._member_caller(state, "chat-1-w1")
+
+    def test_member_worker_dispatches_a_grandchild_with_switch_off(self, monkeypatch):
+        # The worker (member-bound) creates and reaches its OWN child — a
+        # grandchild of the original member — with the global switch OFF, admitted
+        # by the case-(b) member bypass. Depth is capped by the conductor agent,
+        # not here; this fence only bounds reach.
+        monkeypatch.setattr(sc, "_store_is_member_owned", lambda store: store == _CONDUCTOR_STORE)
+        monkeypatch.setattr(sc, "session_control_enabled", lambda: False)
+        monkeypatch.setattr(sc, "member_dispatch_enabled", lambda: True)
+        worker = _slot("chat-1-w1", created_by=_CHAT_CALLER)
+        worker.memory_store = _CONDUCTOR_STORE
+        grandchild = _slot("chat-2-g1", created_by="chat-1-w1")  # created BY the worker
+        grandchild.memory_store = _CONDUCTOR_STORE
+        state = _State({"chat-1-w1": worker, "chat-2-g1": grandchild})
+        with (
+            patch.object(sc, "caller_slot_key", return_value="chat-1-w1"),
+            patch.object(sc, "_resolve_slot", return_value=grandchild),
+        ):
+            resolved = sc.authorize_target(
+                state,
+                caller_session_key="dashboard:worker",
+                target="chat-2-g1",
+                operation="send",
+            )
+        assert resolved is grandchild
+
+    def test_member_worker_is_still_fenced_off_what_it_did_not_create(self, monkeypatch):
+        # The recursion carries the operating model DOWN without carrying reach
+        # ACROSS it: the member-bound worker cannot reach the user's own session
+        # (or a sibling worker's), only its own children.
+        monkeypatch.setattr(sc, "_store_is_member_owned", lambda store: store == _CONDUCTOR_STORE)
+        monkeypatch.setattr(sc, "session_control_enabled", lambda: True)
+        monkeypatch.setattr(sc, "member_dispatch_enabled", lambda: True)
+        worker = _slot("chat-1-w1", created_by=_CHAT_CALLER)
+        worker.memory_store = _CONDUCTOR_STORE
+        user_session = _slot("chat-9-user", created_by="")  # the user's own tab
+        state = _State({"chat-1-w1": worker, "chat-9-user": user_session})
+        with (
+            patch.object(sc, "caller_slot_key", return_value="chat-1-w1"),
+            patch.object(sc, "_resolve_slot", return_value=user_session),
+        ):
+            with pytest.raises(sc.SessionControlError) as exc:
+                sc.authorize_target(
+                    state,
+                    caller_session_key="dashboard:worker",
+                    target="chat-9-user",
+                    operation="send",
+                )
+        assert exc.value.code == "not_creator"
+
+
+class TestCloseReauthorizationDoesNotLoadConfig:
+    """F1 — the close critical section carries the fence verdict, never reloads it.
+
+    ``close_target`` re-runs ``authorize_target`` SYNCHRONOUSLY at
+    ``close_slot``'s point of no return, and the ownership fence there
+    (``_caller_is_ownership_fenced`` -> ``_member_caller`` ->
+    ``_member_store_verdict``) can load config on a cache miss — blocking IO on
+    the event loop inside a no-suspension window. The fix resolves the fence
+    verdict ONCE up front and threads it through ``precomputed_ownership_fenced``,
+    so the re-check consults a carried boolean instead. This pins that the
+    synchronous re-check performs NO ``KiroCrewConfig.load()``.
+    """
+
+    def test_reassert_closeable_reads_no_config(self, tmp_path, monkeypatch, _fresh_create_budget):
+        state = _make_state(tmp_path)
+        caller = state.get_or_create_slot(_CHAT_CALLER)
+        caller.memory_store = _CONDUCTOR_STORE
+        monkeypatch.setattr(sc, "_store_is_member_owned", lambda store: store == _CONDUCTOR_STORE)
+        monkeypatch.setattr(sc, "_workspace_name_for_dir", lambda cfg, ws_dir: caller.workspace)
+        monkeypatch.setattr(sc, "session_control_enabled", lambda: False)
+        monkeypatch.setattr(sc, "member_dispatch_enabled", lambda: True)
+        result = asyncio.run(sc.create_session(state, caller_session_key=slot_history_key(caller)))
+        child_key = result["target"]
+
+        # Count config loads while the SYNCHRONOUS pre-pop re-check runs. It is
+        # invoked from close_target after the initial authorization; assert it is
+        # called (proving the guard runs) yet loads no config (proving the verdict
+        # is carried, not recomputed).
+        real_authorize = sc.authorize_target
+        loads: list[int] = []
+
+        def _counting_load(*a, **k):
+            loads.append(1)
+            raise AssertionError("config must not be loaded during the sync close re-check")
+
+        seen: dict[str, object] = {"precomputed": None}
+
+        def _spy_authorize(*args, **kwargs):
+            if kwargs.get("skip_enabled_check"):
+                # This is the synchronous pre-pop re-check. From here on, any
+                # config load is a regression; record what verdict it carries.
+                seen["precomputed"] = kwargs.get("precomputed_ownership_fenced")
+                monkeypatch.setattr(sc.KiroCrewConfig, "load", _counting_load)
+            return real_authorize(*args, **kwargs)
+
+        monkeypatch.setattr(sc, "authorize_target", _spy_authorize)
+        # Close the member's own worker: the caller is a member (fenced), the
+        # child is owned by it, so the close is authorized and the pre-pop
+        # re-check runs its full identity/containment path with a carried verdict.
+        asyncio.run(
+            sc.close_target(state, caller_session_key=slot_history_key(caller), target=child_key)
+        )
+        assert seen["precomputed"] is True, "close must carry the member fence verdict"
+        assert not loads, "the synchronous close re-check loaded config"
