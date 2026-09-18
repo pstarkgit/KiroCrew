@@ -4386,6 +4386,246 @@ async def api_file_search(request: web.Request) -> web.Response:
     })
 
 
+# ── Path completion (/api/path-complete) ──────────────────────────────────────
+#
+# The chat composer's shell-style `./` / `../` completion. A sibling of
+# ``api_file_search`` above rather than a mode of it, for two reasons that are
+# not cosmetic:
+#
+# * ``/api/file-search`` answers "which files ANYWHERE under this root fuzzily
+#   match these characters"; completion answers "what is IN this one directory".
+#   A recursive fuzzy hit cannot be turned back into the path the user is typing
+#   -- the entry name alone is not the path -- so the row set has to come from a
+#   single directory level.
+# * ``?project=`` on the search endpoint is any path on the host, by design.
+#   Completion must be the opposite: the caller names a KNOWN project directory
+#   (the same allow-list ``api_project_git`` / ``api_project_tree`` use) and the
+#   ``../`` segments are resolved and then re-checked for containment, so no
+#   token typed in the composer can enumerate a directory outside the project.
+
+#: Rows returned by one completion request. The composer popup shows a handful;
+#: this bounds the response for a directory with thousands of entries, which is
+#: also where a shell's own completion stops being useful.
+_PATH_COMPLETE_MAX_ENTRIES = 50
+
+#: Directory entries EXAMINED per request, independent of how many survive the
+#: prefix filter. The listing is one level deep, so this is the only ceiling
+#: needed -- it bounds ``node_modules``-sized directories, where the scan (not
+#: the response) is the cost.
+_PATH_COMPLETE_MAX_SCAN = 5000
+
+
+def _completion_dir_is_contained(root: str, resolved: str) -> bool:
+    """Is *resolved* the project root itself or something under it?
+
+    One spelling for the two places containment is decided -- the directory the
+    token names, and every entry that directory offers -- so the second can
+    never drift from the first.
+    """
+    return resolved == root or resolved.startswith(root + os.sep)
+
+
+def _scan_completion_dir(
+    dir_fd: int, target: str, root: str, prefix: str
+) -> list[dict]:
+    """Rows for one already-pinned directory. Worker-thread only.
+
+    Read through *dir_fd* on POSIX so every name resolves against the directory
+    that was actually inspected rather than against its path a second time.
+    Windows has no ``dir_fd`` support in ``scandir``; there the pin itself is what
+    holds the directory in place (its handle omits ``FILE_SHARE_DELETE``, so
+    neither it nor any directory above it can be renamed while it lives).
+    """
+    # A shell hides dot entries until the user types the dot; so does this.
+    want_hidden = prefix.startswith(".")
+    lowered = prefix.lower()
+    rows: list[dict] = []
+    scanned = 0
+    with os.scandir(dir_fd if platform_compat.IS_POSIX else target) as entries:
+        for entry in entries:
+            if scanned >= _PATH_COMPLETE_MAX_SCAN:
+                break
+            scanned += 1
+            if entry.name.startswith(".") and not want_hidden:
+                continue
+            if lowered and not entry.name.lower().startswith(lowered):
+                continue
+            # Built from the pinned directory's path rather than read off the
+            # entry, because a descriptor-based scan reports each entry's path
+            # as its bare name.
+            full = os.path.join(target, entry.name)
+            try:
+                resolved = os.path.realpath(full)
+                # Resolved BEFORE the sensitivity check so a link into a
+                # sensitive tree cannot be offered, matching ``_collect`` in the
+                # search walk above -- and checked for containment on the same
+                # resolved path, which is what makes a redirected INTERMEDIATE
+                # component unable to leak a name or a size: its entries resolve
+                # outside the project and are dropped here.
+                if not _completion_dir_is_contained(root, resolved):
+                    continue
+                if is_sensitive_path(resolved):
+                    continue
+                is_dir = entry.is_dir()
+                st = entry.stat()
+            except OSError:
+                continue
+            rows.append({
+                "path": full,
+                "name": entry.name,
+                "kind": "dir" if is_dir else "file",
+                "size": 0 if is_dir else st.st_size,
+                "mtime": int(st.st_mtime),
+            })
+
+    # Alphabetical, directories first: the next thing a user completing a path
+    # types is usually another separator.
+    rows.sort(key=lambda r: (r["kind"] != "dir", r["name"].lower()))
+    return rows[:_PATH_COMPLETE_MAX_ENTRIES]
+
+
+def _complete_path_listing(
+    project: str, rel: str, prefix: str
+) -> tuple[str, str, list[dict]]:
+    """List one directory level for path completion. Worker-thread only.
+
+    Every filesystem touch for the request lives here (``realpath``, the
+    directory open, ``scandir`` and the per-entry ``stat``), same shape as
+    ``_resolve_project_git``: a project on a stalled mount must not block the
+    loop on any of them.
+
+    Returns ``(status, root, rows)`` with status ``"ok"``, ``"sensitive"``,
+    ``"outside"`` (the token resolved out of the project) or ``"missing"``.
+
+    Containment is decided on the REALPATH of both sides, so neither a ``../``
+    run in the token nor a symlink inside the project can name a directory
+    outside it. ``rel`` is joined, never expanded: an absolute or ``~``-prefixed
+    value therefore fails the containment check instead of being honoured. It is
+    also never resolved to a string that a later call re-resolves: everything
+    above the ``scandir`` validates a PATH, and a same-UID writer -- an agent
+    working in this very project -- can rename a component and plant a link at
+    its name in between. So the directory is OPENED before it is read, with the
+    open refusing to follow a link at the name
+    (:func:`platform_compat.pin_directory`), and the entries are then read
+    through that descriptor and re-checked for containment one by one.
+    """
+    root = os.path.realpath(os.path.expanduser(project))
+    if is_sensitive_path(root):
+        return "sensitive", root, []
+    target = os.path.realpath(os.path.join(root, rel))
+    if not _completion_dir_is_contained(root, target):
+        return "outside", root, []
+    if is_sensitive_path(target):
+        return "sensitive", root, []
+
+    # ``pin_directory`` raises for a symlink, a reparse point or a non-directory
+    # at the name, and for a directory that has since gone away -- all of which
+    # are "nothing to complete here", not errors worth a status of their own.
+    try:
+        dir_fd = platform_compat.pin_directory(target)
+    except OSError:
+        return "missing", root, []
+    try:
+        rows = _scan_completion_dir(dir_fd, target, root, prefix)
+    except OSError:
+        return "missing", root, []
+    finally:
+        os.close(dir_fd)
+    return "ok", root, rows
+
+
+async def api_path_complete(request: web.Request) -> web.Response:
+    """GET /api/path-complete?path=…&dir=…&q=… — one directory level of a project.
+
+    ``path`` is matched against the gateway's own known project directories and
+    the matched SERVER-HELD value is what gets resolved, so this route cannot
+    enumerate arbitrary host directories. ``dir`` is the caller's relative
+    directory prefix (``./``, ``../src/``) and ``q`` the partial entry name
+    being typed. A ``dir`` that resolves outside the project root is answered
+    with the ordinary empty result set -- not an error, and not a distinguishing
+    field: the composer shows "no matches" while the user is still typing the
+    token, and the refusal is recorded in the SEL audit rather than handed to a
+    caller that has nothing to do with it.
+
+    Rows carry the same shape as ``/api/file-search`` so the picker renders both
+    unchanged, and like that endpoint they are NOT redacted -- the name the
+    picker inserts has to be the real one for the path to resolve.
+    """
+    state: DashboardState = request.app["state"]
+    caller = request.get("user", "dashboard")
+    raw = request.query.get("path", "").strip()
+    if not raw:
+        return web.json_response(
+            {"error": "path required", "code": "path_required"}, status=400
+        )
+    project = await asyncio.to_thread(
+        _match_known_project_for, _slot_project_snapshot(state), raw
+    )
+    if project is None:
+        _sel().log_api_access(
+            caller=caller,
+            operation="path_complete",
+            outcome="denied",
+            resources=raw,
+            error="not a known project directory",
+        )
+        return web.json_response(
+            {"error": "Unknown project directory", "code": "unknown_project_dir"},
+            status=403,
+        )
+
+    rel = request.query.get("dir", "").strip()
+    prefix = request.query.get("q", "").strip()
+
+    # A NUL cannot occur in a path on any supported platform, and the resolver
+    # would raise ValueError rather than OSError for one -- a 500 on caller
+    # input. It is the same answer as any other unresolvable token: nothing to
+    # complete.
+    if "\0" in rel or "\0" in prefix:
+        return web.json_response({"results": [], "root": ""})
+
+    # The resolved directory is caller-INFLUENCED (``dir`` is joined onto the
+    # allow-listed root), so the listing takes a probe slot exactly as the
+    # search walk does rather than a shared default-executor worker.
+    try:
+        status, root, rows = await _run_path_probe(
+            _complete_path_listing, project, rel, prefix, transfer=True
+        )
+    except _PathProbeBusy:
+        return _probe_busy_response(
+            resource=project, operation="path_complete", caller=caller
+        )
+
+    if status == "sensitive":
+        _sel().log_api_access(
+            caller=caller,
+            operation="path_complete",
+            outcome="denied",
+            resources=root,
+            error="sensitive path",
+        )
+        return web.json_response({"error": "Access denied", "code": "access_denied"}, status=403)
+    if status == "outside":
+        _sel().log_api_access(
+            caller=caller,
+            operation="path_complete",
+            outcome="denied",
+            resources=f"{root} dir={rel}",
+            error="outside project root",
+        )
+        return web.json_response({"results": [], "root": ""})
+    if status == "missing":
+        return web.json_response({"results": [], "root": root})
+
+    _sel().log_api_access(
+        caller=caller,
+        operation="path_complete",
+        outcome="allowed",
+        resources=f"{root} dir={rel} q={prefix} results={len(rows)}",
+    )
+    return web.json_response({"results": rows, "root": root})
+
+
 # ── Content search (/api/file-grep) ───────────────────────────────────────────
 #
 # The side-panel Files rail's Content mode: "which files CONTAIN this text".

@@ -2,12 +2,13 @@
 
 ## Overview
 
-This module owns two endpoints over the same handler. `GET /api/file-search`
-finds files and directories by NAME and backs the `@`-mention picker;
-`POST /api/file-grep` finds them by CONTENT and backs the chat side panel's Files
-tab. They share `handlers/files.py`, the sensitive-path fence and the off-loop
-probe discipline, and nothing else: separate roots, separate budgets, separate
-result shapes.
+This module owns three endpoints. `GET /api/file-search` finds files and
+directories by NAME and backs the `@`-mention picker; `POST /api/file-grep` finds
+them by CONTENT and backs the chat side panel's Files tab; `GET /api/path-complete`
+lists ONE directory level and backs the composer's shell-style `./` completion.
+They share `handlers/files.py`, the sensitive-path fence and the off-loop probe
+discipline, and nothing else: separate roots, separate budgets, separate result
+shapes.
 
 File search backs the `@`-mention picker in the dashboard chat composer. A user types `@` followed by a query that meets the endpoint minimum, picks a result, and the composer inserts a token that serializes into the prompt as an attachment marker; `test_short_query_returns_empty` pins the minimum-query refusal.
 
@@ -41,6 +42,66 @@ Response:
 - The endpoint returns at most the normalized `limit`; `test_max_results_capped` and `test_limit_param_honoured` pin the default and expansion behavior. The folder panel expands through its fixed tiers while callers that omit `limit` retain the default page.
 - `root` echoes the sole scoped safe root. Unscoped fallback searches return an empty `root`, as `api_file_search` constructs the response.
 - Ranking is by fuzzy score, then **files before directories** on an equal score, then shorter name, then recency. The file bias keeps directory entries from crowding out the file a user is most likely searching for; `FileIndex.search` and `api_file_search` apply the same ordering, pinned by `test_index_files_outrank_dirs_on_equal_score`.
+
+### `GET /api/path-complete`
+
+One directory level of a project, for the composer's `./` / `../` completion
+(`FilePickerMenu` in `pathMode`). Same row shape as `/api/file-search`, so the
+picker renders both unchanged.
+
+| Param | Required | Description |
+|---|---|---|
+| `path` | yes | A project directory, matched against the gateway's own known-project allow-list (`_match_known_project_for`, the same one `api_project_git` and `api_project_tree` use). The matched SERVER-HELD value is what gets resolved. An unrecognised directory is 403 `unknown_project_dir`; an absent `path` is 400 `path_required`. |
+| `dir` | no | The relative directory prefix the user has typed (`./`, `../src/`), joined onto that root. Never expanded, so an absolute or `~`-prefixed value fails containment rather than being honoured. |
+| `q` | no | Partial entry name. Prefix match, case-insensitive, no minimum length — `./` alone is already an unambiguous request for a listing. Dot-prefixed entries are offered only when `q` itself starts with a dot, as a shell does. |
+
+Response: `{"results", "root"}`. Rows are
+`{"path", "name", "kind", "size", "mtime"}`, directories first
+then alphabetical, capped at `_PATH_COMPLETE_MAX_ENTRIES`; the scan is bounded
+independently by `_PATH_COMPLETE_MAX_SCAN` entries examined, which is what keeps
+a `node_modules`-sized directory cheap. Rows are NOT redacted, like the search
+endpoint's and unlike the tree listing's: the name the picker inserts has to be
+the real one for the path to resolve.
+
+**Containment is the whole point of the separate endpoint.** `?project=` on
+`/api/file-search` is any path on the host by design, which is exactly what a
+`../` token must not become. Here the resolved directory is compared against the
+REALPATH of the allow-listed root, so neither a `../` run nor a symlink inside
+the project can name a directory outside it; a token that resolves outside is
+answered with the ordinary empty result set rather than an error, because the
+user is still mid-token — the refusal is recorded in the SEL audit, not in the
+response, which is why "outside the project" and "no such directory" are one
+answer to the caller. A leading `../` run is not refused as a shape, only as a
+destination: it lists whenever it comes back inside the project
+(`../<project-name>/`), which is the containment rule rather than a special
+case. `test/test_path_complete.py` pins the parent-run refusal, the re-entering
+parent run, the absolute-`dir` refusal and the symlink refusal separately.
+
+**`~/` is deliberately absent.** Bare `$HOME` is not a search root anywhere in
+this module (see the fallback-roots note under scope below), so the composer's
+matcher does not recognise a `~/` token at all; `matchPathToken` in
+`components/composerTokens.ts` pins that.
+
+A NUL in either `dir` or `q` is screened at the boundary and answered as an empty
+listing: no path can contain one, and the resolver raises `ValueError` rather than
+`OSError` for it, which would otherwise be a 500 on caller input.
+
+**Validated once, then read through the descriptor.** Every check above decides
+about a PATH, and a same-UID writer — an agent working in that very project — can
+rename a component and plant a link at its name between the check and the read. So
+`_complete_path_listing` OPENS the directory with `platform_compat.pin_directory`
+(`O_DIRECTORY | O_NOFOLLOW` on POSIX; a no-reparse `CreateFileW` whose share mode
+omits `FILE_SHARE_DELETE` on Windows) and reads the entries through that
+descriptor, and `_scan_completion_dir` re-checks containment on each entry's own
+realpath — the same `_completion_dir_is_contained` the directory itself passed. A
+link swapped in at the leaf is refused by the open; a redirected INTERMEDIATE
+component leaks neither a name nor a size, because its entries resolve outside the
+root and are dropped. A link inside the project aimed out of it is therefore not
+offered either, which is the same rule rather than a second one.
+
+Off-loop like its siblings: the listing runs through `_run_path_probe` on the
+TRANSFER pool, because `dir` makes the resolved directory caller-influenced even
+though the root is server-held.
 
 ### `POST /api/file-grep`
 
@@ -233,7 +294,8 @@ shows literally — the same trade-off inline file mentions make.
 | `website/src/pages/chat/FileBrowserRail.tsx` | Files tab: Name/Content toggle, result rows, status row |
 | `website/src/api/fileGrep.ts` | `/api/file-grep` client and result types |
 | `src/kiro_crew/dashboard/file_index.py` | `FileIndex`, `FileIndexRegistry` |
-| `website/src/components/FilePickerMenu.tsx` | Picker UI, `kind` propagation, trailing-slash insertion |
+| `website/src/components/FilePickerMenu.tsx` | Picker UI, `kind` propagation, trailing-slash insertion, `pathMode` |
+| `website/src/components/composerTokens.ts` | Caret-relative `@` / `$` / `./` token matchers and the shared token replace |
 | `website/src/components/ChatInput.tsx` | Composer wiring, pending file/folder preview strip |
 | `website/src/utils/fileTokens.ts` | Attachment-marker owner: file AND dir token parse/serialize/resolve |
 | `website/src/pages/ChatPage.tsx` | Token-derived staging, send/steer serialization, bubble chips |
@@ -243,6 +305,9 @@ shows literally — the same trade-off inline file mentions make.
 | File | Coverage |
 |---|---|
 | `test/test_file_search.py` | Endpoint behaviour, scoring, exclusions |
+| `test/test_path_complete.py` | Directory listing, prefix + dot-entry rules, cap, the containment refusals (`../` escape, absolute `dir`, symlink out, an entry pointing out), the re-entering `../` run, and the swap-after-validation race |
+| `website/src/test/ChatInput.pathTrigger.test.tsx` | The `./` trigger: scoping per token, Tab/Enter accept, directory re-open, Escape, no `~/`, no menu without a project |
+| `website/src/test/composerTokens.test.ts` | Token matchers and detection↔insertion span agreement |
 | `test/test_file_grep.py` | Engine parity, the stdin pattern channel, anchored exclusions, deadline-bounded extraction, row redaction |
 | `website/src/test/FileBrowserRail.test.tsx` | Toggle default and remount, request floor, status row, document note, project-switch invalidation |
 | `website/src/test/fileGrep.test.ts` | The wire call: path, URL-encoded `root`/`q`, body returned as-is, transport errors surface |
