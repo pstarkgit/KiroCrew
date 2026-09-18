@@ -106,6 +106,66 @@ export async function openFileInEditor(
     return { ok: false, error: err instanceof Error ? err.message : String(err) }
   }
 }
+
+/**
+ * Whether the "Open in editor" affordance can work for a DIRECTORY in this
+ * window — the per-project action (issue #1142).
+ *
+ * Two conditions, because the channel enforces two.
+ *
+ * `fileOpenAPI.openDir` is probed specifically rather than reusing
+ * `canOpenFileInEditor`. The desktop shell LOADS the gateway's SPA, so the two
+ * are independently versioned: an updated gateway can serve this dashboard into
+ * a shell whose preload predates `openDir` and exposes `open` alone. A shared
+ * gate would then render a folder control whose IPC channel that shell never
+ * registered — a dead click with an opaque error.
+ *
+ * The SHELL's platform must also be Linux, because that is the only platform the
+ * main process will launch a directory on. There, the native open forks inside
+ * the `shell.openPath()` call, so the handler's realpath / not-a-bundle checks
+ * bind the object that actually opens; macOS and Windows defer the open to a
+ * worker and re-resolve the path afterwards, which for a directory is an
+ * arbitrary-code-execution window (a macOS bundle IS a directory). Linux is also
+ * the only platform where a folder's handler is a user-configurable MIME binding
+ * (`inode/directory`) — elsewhere `shell.openPath` on a folder opens
+ * Finder/Explorer, which the reveal action already does — so this withholds
+ * nothing a user could have configured. Reading the platform HERE keeps the row
+ * from promising a launch the channel refuses.
+ *
+ * Both reads are lazy (not the module-load `mc` capture), so a test can stub the
+ * bridge and the platform per-case.
+ */
+export function canOpenDirInEditor(): boolean {
+  if (electronPlatform() !== 'linux') return false
+  return typeof (window as { fileOpenAPI?: { openDir?: unknown } }).fileOpenAPI?.openDir === 'function'
+}
+
+/**
+ * Hand a DIRECTORY path to the desktop shell to open in the OS default handler
+ * for folders on the user's own machine (via shell.openPath in the main
+ * process) — the project folder in the editor or file manager the user has
+ * configured for `inode/directory`, never a URL scheme.
+ *
+ * Same contract as {@link openFileInEditor}: resolves the main process's
+ * `{ ok, error? }` verdict, or `{ ok: false, error: 'unavailable' }` when no
+ * bridge is present, so a caller in a plain browser gets a definite negative
+ * rather than a thrown error. The main process refuses a path that is not a
+ * directory, and refuses a macOS program bundle (which IS a directory but
+ * LAUNCHES on open).
+ */
+export async function openDirInEditor(
+  dirPath: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const api = (window as {
+    fileOpenAPI?: { openDir?: (p: string) => Promise<{ ok: boolean; error?: string }> }
+  }).fileOpenAPI
+  if (typeof api?.openDir !== 'function') return { ok: false, error: 'unavailable' }
+  try {
+    return await api.openDir(dirPath)
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+  }
+}
 /**
  * Width reserved on the right for the Windows titleBarOverlay caption buttons
  * (minimize/maximize/close). The overlay is 138px wide at default DPI on

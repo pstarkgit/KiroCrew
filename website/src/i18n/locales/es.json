@@ -8536,6 +8536,7 @@
     "filePathMenu": {
       "copy_failed": "No se pudo copiar la ruta",
       "copy_path": "Copiar ruta",
+      "open_folder_in_editor": "Abrir la carpeta en el editor",
       "path_copied": "Ruta copiada",
       "reveal_blocked": "Esta ruta está protegida y no se puede abrir.",
       "reveal_failed": "No se pudo abrir esta ruta en el equipo donde se ejecuta {{productName}}."
@@ -10245,6 +10246,9 @@
       },
       "filesHome": {
         "no_project_dir": "Este chat no tiene un directorio de proyecto",
+        "open_project_in_editor": "Abrir el proyecto en el editor",
+        "open_terminal": "Abrir un terminal en el directorio del proyecto",
+        "project_actions": "Acciones del proyecto",
         "refresh": "Actualizar",
         "select_file_hint": "Selecciona un archivo del árbol para abrirlo en una nueva pestaña",
         "title": "Archivos",

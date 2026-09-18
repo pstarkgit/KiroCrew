@@ -33,6 +33,15 @@ vi.mock('../hooks/useBranding', () => ({
   useBranding: () => ({ botName: 'Test', avatar: '', directLocal: brandingEnv.directLocal }),
 }))
 
+// The desktop-shell bridge the "Open project in editor" action is gated on.
+// A browser tab and the PWA expose no `fileOpenAPI`, so the default here is the
+// browser case and the dedicated cases below opt in.
+const editorEnv = vi.hoisted(() => ({ enabled: false, openDir: vi.fn() }))
+vi.mock('../lib/electron', () => ({
+  canOpenDirInEditor: () => editorEnv.enabled,
+  openDirInEditor: editorEnv.openDir,
+}))
+
 vi.mock('../pierre/tree', () => ({
   TreeSkeleton: () => null,
   PierreWorkspaceTree: (p: { onFileOpen?: (abs: string) => void }) => (
@@ -48,14 +57,26 @@ const DIR = '/repo/my-project'
  *  scoped to the header rather than the whole panel. */
 const header = () => screen.getByText('Files').parentElement as HTMLElement
 
-function mount(dir = DIR, onFileOpen: (p: string, d: boolean) => void = vi.fn()) {
+function mount(
+  dir = DIR,
+  onFileOpen: (p: string, d: boolean) => void = vi.fn(),
+  onOpenTerminal?: () => void,
+) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   const utils = render(
     <QueryClientProvider client={qc}>
-      <FilesHomePanel projectDir={dir} onFileOpen={onFileOpen} />
+      <FilesHomePanel projectDir={dir} onFileOpen={onFileOpen} onOpenTerminal={onOpenTerminal} />
     </QueryClientProvider>,
   )
   return { qc, onFileOpen, ...utils }
+}
+
+/** Open the header's `Project actions` overflow. Radix opens on keyboard
+ *  activation — the path jsdom handles, unlike the PointerEvent mouse open. */
+function openProjectActions() {
+  const trigger = within(header()).getByLabelText('Project actions')
+  fireEvent.keyDown(trigger, { key: 'Enter' })
+  return trigger
 }
 
 beforeEach(() => {
@@ -63,6 +84,8 @@ beforeEach(() => {
   H.api.projectGitStatus.mockReset().mockResolvedValue({ repo: true, files: [] })
   H.api.revealPath.mockReset().mockResolvedValue(undefined)
   brandingEnv.directLocal = true
+  editorEnv.enabled = false
+  editorEnv.openDir.mockReset().mockResolvedValue({ ok: true })
 })
 
 describe('FilesHomePanel header', () => {
@@ -128,6 +151,94 @@ describe('FilesHomePanel header', () => {
     brandingEnv.directLocal = false
     mount()
     expect(within(header()).queryByLabelText('Show in file manager')).toBeNull()
+  })
+})
+
+describe('FilesHomePanel per-project quick actions', () => {
+  it('spawns a terminal in the project directory from the actions menu', async () => {
+    // The point of the affordance: a shell already `cd`'d into the project,
+    // reachable without knowing that a side-panel tab kind spawns one.
+    const onOpenTerminal = vi.fn()
+    mount(DIR, vi.fn(), onOpenTerminal)
+    openProjectActions()
+    fireEvent.click(await screen.findByText('Open terminal in the project directory'))
+    expect(onOpenTerminal).toHaveBeenCalledTimes(1)
+  })
+
+  it('withholds the terminal action when the host serves no terminal', async () => {
+    // No callback = the terminal feature is off or the host withdrew the view.
+    // Offering the row anyway would promise a shell that never starts.
+    mount(DIR)
+    await waitFor(() => expect(screen.getByTestId('tree')).toBeInTheDocument())
+    // Nothing left for the menu to hold once the tree has resolved, so the
+    // trigger itself is gone rather than opening an empty menu.
+    expect(within(header()).queryByLabelText('Project actions')).toBeNull()
+  })
+
+  it('opens the project directory through the desktop-shell bridge', async () => {
+    editorEnv.enabled = true
+    mount()
+    openProjectActions()
+    fireEvent.click(await screen.findByText('Open project in editor'))
+    await waitFor(() => expect(editorEnv.openDir).toHaveBeenCalledWith(DIR))
+    // The editor launch is a shell IPC call, never the gateway reveal endpoint.
+    expect(H.api.revealPath).not.toHaveBeenCalled()
+  })
+
+  it('withholds the editor action in a browser tab with no shell bridge', async () => {
+    // Gated on the preload bridge, NOT on directLocal: a local browser tab has
+    // no `fileOpenAPI` and cannot launch anything on the host.
+    const onOpenTerminal = vi.fn()
+    mount(DIR, vi.fn(), onOpenTerminal)
+    openProjectActions()
+    expect(await screen.findByText('Open terminal in the project directory')).toBeInTheDocument()
+    expect(screen.queryByText('Open project in editor')).toBeNull()
+  })
+
+  it('reports an editor-launch refusal on its own line, not the reveal line', async () => {
+    editorEnv.enabled = true
+    editorEnv.openDir.mockResolvedValue({ ok: false, error: 'not a directory' })
+    mount()
+    openProjectActions()
+    fireEvent.click(await screen.findByText('Open project in editor'))
+    const notice = await screen.findByTestId('files-home-editor-error')
+    expect(notice).toHaveTextContent('not a directory')
+    expect(screen.queryByTestId('files-home-reveal-error')).toBeNull()
+  })
+
+  it('keeps the header at two controls, with both new actions inside the menu', async () => {
+    // `max-two-buttons-per-row` caps the row, so the two per-project actions go
+    // in one overflow trigger rather than beside Reveal — which shipped as one
+    // click and keeps it. Held pending as well as settled, so the assertion
+    // covers the in-flight state the old (unreachable) Refresh branch claimed.
+    editorEnv.enabled = true
+    H.api.projectTree.mockReturnValue(new Promise(() => {}))
+    mount(DIR, vi.fn(), vi.fn())
+    expect(within(header()).getAllByRole('button').map(b => b.getAttribute('aria-label'))).toEqual([
+      'Show in file manager', 'Project actions',
+    ])
+    openProjectActions()
+    expect(await screen.findByText('Open project in editor')).toBeInTheDocument()
+    expect(screen.getByText('Open terminal in the project directory')).toBeInTheDocument()
+  })
+
+  it('offers no header Refresh, whose branch could never render', async () => {
+    // With a project directory set, `useTreeState` answers only `ready` or
+    // `error` (`ready` covers in-flight on purpose), so the header's old
+    // `!treeAvailable && treeState !== 'error'` Refresh was dead in every state.
+    // The reachable refreshes are the rail's own and the tree-error state's.
+    editorEnv.enabled = true
+    H.api.projectTree.mockReturnValue(new Promise(() => {}))
+    mount(DIR, vi.fn(), vi.fn())
+    expect(within(header()).queryByLabelText('Refresh')).toBeNull()
+    openProjectActions()
+    expect(await screen.findByText('Open project in editor')).toBeInTheDocument()
+    expect(screen.queryByText('Refresh')).toBeNull()
+  })
+
+  it('drops the actions menu entirely when no directory is set', () => {
+    mount('', vi.fn(), vi.fn())
+    expect(within(header()).queryByLabelText('Project actions')).toBeNull()
   })
 })
 

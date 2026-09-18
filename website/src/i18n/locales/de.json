@@ -8421,6 +8421,7 @@
     "filePathMenu": {
       "copy_failed": "Pfad konnte nicht kopiert werden",
       "copy_path": "Pfad kopieren",
+      "open_folder_in_editor": "Ordner im Editor öffnen",
       "path_copied": "Pfad kopiert",
       "reveal_blocked": "Dieser Pfad ist geschützt und kann nicht geöffnet werden.",
       "reveal_failed": "Dieser Pfad konnte auf dem Computer, auf dem {{productName}} läuft, nicht geöffnet werden."
@@ -10102,6 +10103,9 @@
       },
       "filesHome": {
         "no_project_dir": "Für diesen Chat ist kein Projektverzeichnis festgelegt",
+        "open_project_in_editor": "Projekt im Editor öffnen",
+        "open_terminal": "Terminal im Projektverzeichnis öffnen",
+        "project_actions": "Projektaktionen",
         "refresh": "Aktualisieren",
         "select_file_hint": "Wähle eine Datei im Baum, um sie in einem neuen Tab zu öffnen",
         "title": "Dateien",

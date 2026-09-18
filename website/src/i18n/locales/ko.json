@@ -8306,6 +8306,7 @@
     "filePathMenu": {
       "copy_failed": "경로를 복사하지 못했습니다",
       "copy_path": "경로 복사",
+      "open_folder_in_editor": "폴더를 편집기에서 열기",
       "path_copied": "경로 복사됨",
       "reveal_blocked": "이 경로는 보호되어 있어 열 수 없습니다.",
       "reveal_failed": "{{productName}}이(가) 실행 중인 컴퓨터에서 이 경로를 열 수 없습니다."
@@ -9959,6 +9960,9 @@
       },
       "filesHome": {
         "no_project_dir": "이 채팅에는 프로젝트 디렉터리가 설정되어 있지 않습니다",
+        "open_project_in_editor": "프로젝트를 편집기에서 열기",
+        "open_terminal": "프로젝트 디렉터리에서 터미널 열기",
+        "project_actions": "프로젝트 작업",
         "refresh": "새로 고침",
         "select_file_hint": "트리에서 파일을 선택하면 새 탭에서 열립니다",
         "title": "파일",

@@ -182,8 +182,19 @@ contextBridge.exposeInMainWorld("wslAPI", {
 // user's own machine. Resolves { ok, error? }. Absent in a plain browser and in
 // the PWA — the renderer treats a missing bridge as "cannot open externally" and
 // hides the control, keeping the built-in viewer as the only path there.
+//
+// `openDir` is the same hand-off for a DIRECTORY — the per-project "Open in
+// editor" action. Its own channel, because the main process admits a file by
+// extension and a directory by "not a program bundle", and admits a directory
+// only on Linux, where the native open resolves the path inside the call so
+// those checks bind what actually opens; see the two handlers in
+// ipc-registrar.js. Feature-detected separately by the renderer: the shell loads
+// the gateway's SPA, so an updated dashboard can run inside a shell whose preload
+// predates this key, and the folder action must be hidden there instead of
+// invoking a channel that shell never registered.
 contextBridge.exposeInMainWorld("fileOpenAPI", {
   open: (filePath) => ipcRenderer.invoke("dashboard:open-file", String(filePath || "")),
+  openDir: (dirPath) => ipcRenderer.invoke("dashboard:open-dir", String(dirPath || "")),
 });
 
 // Native zoom bridge for the Settings > Display "Zoom Level" stepper.

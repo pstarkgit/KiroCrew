@@ -8306,6 +8306,7 @@
     "filePathMenu": {
       "copy_failed": "パスをコピーできませんでした",
       "copy_path": "パスをコピー",
+      "open_folder_in_editor": "フォルダーをエディタで開く",
       "path_copied": "パスをコピーしました",
       "reveal_blocked": "このパスは保護されているため開けません。",
       "reveal_failed": "{{productName}} を実行しているマシンでこのパスを開けませんでした。"
@@ -9959,6 +9960,9 @@
       },
       "filesHome": {
         "no_project_dir": "このチャットにはプロジェクトディレクトリが設定されていません",
+        "open_project_in_editor": "プロジェクトをエディタで開く",
+        "open_terminal": "プロジェクトディレクトリでターミナルを開く",
+        "project_actions": "プロジェクトの操作",
         "refresh": "更新",
         "select_file_hint": "ツリーからファイルを選択すると新しいタブで開きます",
         "title": "ファイル",

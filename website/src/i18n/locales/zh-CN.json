@@ -8306,6 +8306,7 @@
     "filePathMenu": {
       "copy_failed": "无法复制路径",
       "copy_path": "复制路径",
+      "open_folder_in_editor": "在编辑器中打开文件夹",
       "path_copied": "路径已复制",
       "reveal_blocked": "此路径受保护，无法打开。",
       "reveal_failed": "无法在运行 {{productName}} 的计算机上打开此路径。"
@@ -9959,6 +9960,9 @@
       },
       "filesHome": {
         "no_project_dir": "此聊天未设置项目目录",
+        "open_project_in_editor": "在编辑器中打开项目",
+        "open_terminal": "在项目目录中打开终端",
+        "project_actions": "项目操作",
         "refresh": "刷新",
         "select_file_hint": "在树中选择一个文件，即可在新标签页中打开",
         "title": "文件",

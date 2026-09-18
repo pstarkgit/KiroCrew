@@ -3240,6 +3240,9 @@
     },
     "pierreEditorImpl": {
       "highlighting_unavailable_with_reason": "Syntax highlighting is unavailable until you reload. Content remains readable. Last failure: {{classification}} (generation {{generation}}, attempt {{attempt}}): {{reason}}"
+    },
+    "filePathMenu": {
+      "open_folder_in_editor": "Open folder in editor"
     }
   },
   "hooks": {
@@ -3980,6 +3983,9 @@
       },
       "filesHome": {
         "no_project_dir": "No project directory is set for this chat",
+        "open_project_in_editor": "Open project in editor",
+        "open_terminal": "Open terminal in the project directory",
+        "project_actions": "Project actions",
         "refresh": "Refresh",
         "select_file_hint": "Select a file from the tree to open it in a new tab",
         "title": "Files",

@@ -97,6 +97,40 @@ function hardenedLauncherPath(platform = process.platform) {
 }
 
 /**
+ * Whether this platform's `OpenPath` resolves and launches the path INSIDE the
+ * `shell.openPath()` call, rather than posting the work to a worker.
+ *
+ * A separate predicate from {@link hardenedLauncherPath} even though both answer
+ * "Linux" today, because they state DIFFERENT facts and could diverge: that one
+ * is about WHICH launcher binary is resolved (through PATH or not), this one is
+ * about WHEN the path string is resolved. Conflating them would make a later
+ * maintainer read a PATH decision as a timing guarantee.
+ *
+ * WHY A CALLER WOULD ASK. A validate-then-launch handler only holds if the
+ * launch resolves the path it validated. Where the native open is deferred
+ * (macOS: a dispatch queue; Windows: a COM STA task runner -- see the header's
+ * platform_util citations), the path is re-resolved AFTER the checks, so anything
+ * able to rename within that window decides what actually opens. That is
+ * survivable for a target admitted by a passive-type extension allowlist, and it
+ * is not survivable for a DIRECTORY: on macOS a program bundle IS a directory and
+ * opening one executes it, so a swap converts an open into arbitrary code
+ * execution. `dashboard:open-dir` therefore admits the launch only where this
+ * answers true.
+ *
+ * Pinned to the same {@link ELECTRON_MAJOR_VERIFIED} constant as the PATH
+ * mitigation, and for the same reason: the timing is an implementation detail
+ * that varies by platform and can therefore vary by version, so the guard test
+ * in test/open-path.test.js makes an Electron bump re-verify it rather than let
+ * it silently change meaning.
+ *
+ * @param {string} [platform] - `process.platform` (injectable for tests)
+ * @returns {boolean}
+ */
+function nativeOpenIsSynchronous(platform = process.platform) {
+  return platform === "linux";
+}
+
+/**
  * Hand a filesystem path to the OS opener, hardening the launcher PATH on Linux.
  *
  * A drop-in wrapper for `shell.openPath(filePath)`: same argument, same
@@ -154,5 +188,6 @@ module.exports = {
   LINUX_LAUNCHER_PATH,
   ELECTRON_MAJOR_VERIFIED,
   hardenedLauncherPath,
+  nativeOpenIsSynchronous,
   openPathHardened,
 };

@@ -17,6 +17,12 @@ const platformEnv = vi.hoisted(() => ({ value: 'other' as 'other' | 'darwin' | '
 const editorEnv = vi.hoisted(() => ({
   enabled: false,
   open: vi.fn(),
+  // The DIRECTORY half of the fileOpenAPI bridge, feature-detected separately
+  // from the file half: the shell loads the gateway's SPA, so an updated
+  // dashboard can run inside a shell whose preload exposes `open` alone, and the
+  // folder row must be withheld there rather than dead-click.
+  dirEnabled: false,
+  openDir: vi.fn(),
 }))
 
 vi.mock('../hooks/useBranding', () => ({
@@ -33,6 +39,8 @@ vi.mock('../hooks/useGatewayPlatform', () => ({
 vi.mock('../lib/electron', () => ({
   canOpenFileInEditor: () => editorEnv.enabled,
   openFileInEditor: editorEnv.open,
+  canOpenDirInEditor: () => editorEnv.dirEnabled,
+  openDirInEditor: editorEnv.openDir,
 }))
 
 vi.mock('../api/client', async importOriginal => {
@@ -64,6 +72,8 @@ beforeEach(() => {
   platformEnv.value = 'other'
   editorEnv.enabled = false
   editorEnv.open.mockResolvedValue({ ok: true })
+  editorEnv.dirEnabled = false
+  editorEnv.openDir.mockResolvedValue({ ok: true })
   vi.mocked(api.revealPath).mockResolvedValue({ ok: true })
   vi.mocked(copyToClipboard).mockResolvedValue(true)
   __resetErrorJournalForTests()
@@ -76,6 +86,7 @@ afterEach(() => {
   brandingEnv.directLocal = true
   platformEnv.value = 'other'
   editorEnv.enabled = false
+  editorEnv.dirEnabled = false
   __resetNavSeamForTests()
 })
 
@@ -428,6 +439,64 @@ describe('FilePathMenu', () => {
       expect(screen.getByText('Copy path')).toBeInTheDocument()
       // A directory cannot be "opened" — /api/reveal 400s an open on a dir.
       expect(screen.queryByText('Open with default app')).not.toBeInTheDocument()
+    })
+
+    it('offers "Open folder in editor" and hands the dir to the openDir bridge', async () => {
+      const DIR = '/home/user/project'
+      editorEnv.dirEnabled = true
+      renderWithProviders(
+        <FilePathMenu filePath={DIR} kind="dir">
+          <span data-testid="trigger">project</span>
+        </FilePathMenu>,
+      )
+
+      rightClick(screen.getByTestId('trigger'))
+
+      const row = await screen.findByRole('menuitem', { name: 'Open folder in editor' })
+      fireEvent.click(row)
+
+      await waitFor(() => expect(editorEnv.openDir).toHaveBeenCalledWith(DIR))
+      // The file half of the bridge must not be reached for a directory: it
+      // admits a path by EXTENSION, which a directory does not have.
+      expect(editorEnv.open).not.toHaveBeenCalled()
+      // The file wording would over-promise for a folder (the handler may be
+      // the file manager), so the two rows are deliberately different strings.
+      expect(screen.queryByText('Open in editor')).not.toBeInTheDocument()
+    })
+
+    it('withholds the folder row when only the file half of the bridge exists', async () => {
+      // An older desktop shell: `fileOpenAPI.open` is present, `openDir` is not.
+      // A shared gate would render a row whose IPC channel that shell never
+      // registered — a dead click with an opaque error.
+      editorEnv.enabled = true
+      editorEnv.dirEnabled = false
+      renderWithProviders(
+        <FilePathMenu filePath="/home/user/project" kind="dir">
+          <span data-testid="trigger">project</span>
+        </FilePathMenu>,
+      )
+
+      rightClick(screen.getByTestId('trigger'))
+
+      await waitFor(() => expect(screen.getByText('Copy path')).toBeInTheDocument())
+      expect(screen.queryByText('Open folder in editor')).not.toBeInTheDocument()
+      expect(screen.queryByText('Open in editor')).not.toBeInTheDocument()
+    })
+
+    it('reports an openDir refusal in the editor error line', async () => {
+      editorEnv.dirEnabled = true
+      editorEnv.openDir.mockResolvedValue({ ok: false, error: 'not a directory' })
+      renderWithProviders(
+        <FilePathMenu filePath="/Applications/Calculator.app" kind="dir">
+          <span data-testid="trigger">Calculator.app</span>
+        </FilePathMenu>,
+      )
+
+      rightClick(screen.getByTestId('trigger'))
+      fireEvent.click(await screen.findByRole('menuitem', { name: 'Open folder in editor' }))
+
+      const alert = await screen.findByTestId('file-path-menu-editor-error')
+      expect(alert).toHaveTextContent('not a directory')
     })
   })
 })

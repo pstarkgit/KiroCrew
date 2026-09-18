@@ -40,6 +40,9 @@ function createIpcRegistrar({
   // companion being wired.
   closeCrewCompanionForUpdate = () => {},
   reopenCrewCompanionAfterUpdate = () => {},
+  // The host platform, injectable so a platform-gated channel can be exercised
+  // for every platform from one CI runner instead of only the one it runs on.
+  platform = process.platform,
 } = {}) {
   if (!electron) throw new Error("createIpcRegistrar: electron is required");
   if (!store) throw new Error("createIpcRegistrar: store is required");
@@ -371,6 +374,103 @@ function createIpcRegistrar({
         return { ok: true };
       } catch (e) {
         log(`dashboard:open-file refused: ${e && e.message}`);
+        return { ok: false, error: String((e && e.message) || e) };
+      }
+    });
+
+    // Open a PROJECT DIRECTORY in the user's own editor / folder handler, by
+    // handing its path to the OS default handler on the machine in front of them.
+    //
+    // Sibling to `dashboard:open-file`, and gated identically: this is a LAUNCH
+    // on the local machine, so it takes the full three-gate local-dashboard
+    // check, and the launch goes through `openPathHardened` so the Linux
+    // bare-name `xdg-open` lookup cannot be shadowed (see open-path.js).
+    //
+    // WHY A SEPARATE CHANNEL, NOT A FLAG ON open-file. The two share a launch
+    // primitive and NOTHING else: `open-file` admits a path by its EXTENSION
+    // (a fixed passive-only allowlist, because the extension decides which app
+    // runs and whether that app can execute the file's contents), while a
+    // directory has no meaningful extension and its handler — Finder, Explorer,
+    // the `inode/directory` MIME handler, which a developer may point at their
+    // IDE — renders a listing rather than executing anything inside it. One
+    // handler taking a "kind" argument would have to hold both verdicts, and a
+    // caller that got the argument wrong would slip a file past the allowlist.
+    //
+    // WHAT IS STILL REFUSED, AND WHY. "It is a directory" is not by itself safe,
+    // because some directories ARE programs: on macOS a bundle
+    // (`Calculator.app`, an installer, a Quick Look generator) is a directory,
+    // and `shell.openPath` on one LAUNCHES it. The path can reach here from an
+    // agent-authored transcript chip, so two independent screens run:
+    //   - the resolved suffix must not be a bundle suffix (`BUNDLE_DIR_EXTS`) —
+    //     cheap, and correct on every platform; and
+    //   - the directory must not carry `Contents/Info.plist`, which is the
+    //     ACTUAL macOS bundle predicate and therefore catches a bundle whose
+    //     suffix is not on the list (LaunchServices honours the plist, not the
+    //     name).
+    // realpath runs BEFORE both, so a symlink named like a plain folder is
+    // judged by what it resolves to.
+    //
+    // AND WHY THOSE SCREENS ARE ONLY ENOUGH ON LINUX. They validate a path
+    // STRING, so they hold only if the launch resolves the same string they
+    // judged. `nativeOpenIsSynchronous` is exactly that question: on Linux the
+    // fork+execvp happens inside the `shell.openPath()` call, while macOS and
+    // Windows post the native open to a worker and re-resolve the path
+    // afterwards. In that deferred window anything able to rename decides what
+    // opens — and for a DIRECTORY the replacement can be a program (a bundle),
+    // which turns an open into arbitrary code execution. So the deferred
+    // platforms are refused outright rather than handed a check that does not
+    // bind. That costs the feature nothing: a folder's handler is a
+    // user-configurable MIME binding (`inode/directory`) only on Linux, and on
+    // macOS/Windows `shell.openPath` on a folder just opens Finder/Explorer,
+    // which the gateway's own reveal already does. The renderer gates the row on
+    // the same platform, so nothing offers what this refuses.
+    ipcMain.handle("dashboard:open-dir", async (event, dirPath) => {
+      await assertLocalDashboard(event, "dashboard:open-dir");
+      const { nativeOpenIsSynchronous, openPathHardened } = require("./open-path");
+      // Before the path is even read: a refusal that depends on the host, not on
+      // the argument, must not be reachable through a crafted argument.
+      if (!nativeOpenIsSynchronous(platform)) {
+        return { ok: false, error: "unsupported platform" };
+      }
+      if (typeof dirPath !== "string" || dirPath === "") {
+        return { ok: false, error: "no path" };
+      }
+      const fs = require("fs");
+      const nodePath = require("path");
+      // Directory suffixes the OS treats as ONE launchable / installable unit
+      // rather than a folder to browse. Opening one runs code (an app bundle,
+      // an installer, a plug-in host), which is exactly what this affordance
+      // must not become. A fixed set, deliberately not user-extensible — same
+      // reasoning as `OPENABLE_EXTS` above.
+      const BUNDLE_DIR_EXTS = new Set([
+        ".app", ".appex", ".xpc", ".systemextension", ".bundle", ".framework",
+        ".kext", ".plugin", ".pkg", ".mpkg", ".prefpane", ".qlgenerator",
+        ".saver", ".service", ".wdgt", ".workflow", ".action", ".scptd",
+      ]);
+      try {
+        // realpath BEFORE the suffix and bundle tests: a plain-looking symlink
+        // must be judged by the directory it actually resolves to.
+        const real = fs.realpathSync(dirPath);
+        if (!fs.statSync(real).isDirectory()) {
+          return { ok: false, error: "not a directory" };
+        }
+        if (BUNDLE_DIR_EXTS.has(nodePath.extname(real).toLowerCase())) {
+          return { ok: false, error: "not a directory" };
+        }
+        // The real macOS bundle predicate, so a bundle suffix absent from the
+        // set above is still refused. `existsSync` (not a stat) because the
+        // question is only presence, and an unreadable bundle must still refuse.
+        if (fs.existsSync(nodePath.join(real, "Contents", "Info.plist"))) {
+          return { ok: false, error: "not a directory" };
+        }
+        const err = await openPathHardened(shell, real);
+        if (err) {
+          log(`dashboard:open-dir: OS refused ${real}: ${err}`);
+          return { ok: false, error: err };
+        }
+        return { ok: true };
+      } catch (e) {
+        log(`dashboard:open-dir refused: ${e && e.message}`);
         return { ok: false, error: String((e && e.message) || e) };
       }
     });

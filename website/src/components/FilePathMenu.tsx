@@ -25,6 +25,14 @@
  * `open` action on a directory (400), so offering it would be a guaranteed-fail
  * click. Reveal still applies — it shows the folder in the file manager.
  *
+ * "Open in editor" is NOT hidden for directories, because it is a different
+ * mechanism with a different verdict: it goes to the desktop shell's
+ * `fileOpenAPI` bridge (`shell.openPath` in the main process), which accepts a
+ * directory and hands it to the handler the user configured for folders — their
+ * IDE, on a machine set up that way. That is the per-project "open my project"
+ * action issue #1142 asked for, so the row routes by kind (`openDirInEditor`
+ * vs `openFileInEditor`) instead of standing down.
+ *
  * It is also hidden on a Windows gateway: files.py refuses the launch-by-
  * association verb there (platform_compat.open_with_default_app answers False,
  * so the backend degrades an `open` to a clipboard copy), which would make the
@@ -43,7 +51,7 @@ import { useBranding } from '../hooks/useBranding'
 import { useGatewayPlatform } from '../hooks/useGatewayPlatform'
 import { api, ApiError } from '../api/client'
 import { copyToClipboard } from '../utils/clipboard'
-import { canOpenFileInEditor, openFileInEditor } from '../lib/electron'
+import { canOpenDirInEditor, canOpenFileInEditor, openDirInEditor, openFileInEditor } from '../lib/electron'
 import { i18nT } from '../i18n/t'
 
 /** What the wrapped path is on disk. Directories cannot be "opened".
@@ -284,19 +292,29 @@ function FilePathMenuItems({ filePath, kind }: FilePathMenuItemsProps) {
       : i18nT('components.filePathMenu.copy_path')
 
   // "Open in editor" hands the PATH to the desktop shell's shell.openPath bridge
-  // so the file opens in the user's own OS default handler — the one place the
+  // so the target opens in the user's own OS default handler — the one place the
   // built-in viewer and the gateway-host reveal cannot reach. Shown only when
   // the fileOpenAPI preload bridge exists (desktop shell, not a browser tab or
-  // the PWA) and the target is a file, not a directory. Its own error line,
-  // separate from the gateway reveal's, since this launch happens entirely in
-  // the shell and never touches /api/reveal.
-  const canOpenInEditor = kind !== 'dir' && canOpenFileInEditor()
-  const openInEditorLabel = i18nT('components.markdownPanel.open_in_editor')
+  // the PWA). Its own error line, separate from the gateway reveal's, since this
+  // launch happens entirely in the shell and never touches /api/reveal.
+  //
+  // A DIRECTORY is served by the bridge's `openDir` half, gated on its own
+  // feature probe: the shell loads the gateway's SPA, so an updated dashboard can
+  // run inside a shell whose preload exposes `open` alone, and the folder row
+  // must be withheld there rather than call a channel that shell never
+  // registered. The LABEL differs too — "Open folder in editor" — because for a
+  // folder the handler may well be the file manager, and a row that borrowed the
+  // file wording would over-promise.
+  const isDir = kind === 'dir'
+  const canOpenInEditor = isDir ? canOpenDirInEditor() : canOpenFileInEditor()
+  const openInEditorLabel = isDir
+    ? i18nT('components.filePathMenu.open_folder_in_editor')
+    : i18nT('components.markdownPanel.open_in_editor')
   const [editorError, setEditorError] = useState<string | null>(null)
   useEffect(() => { setEditorError(null) }, [filePath])
   const openInEditor = async () => {
     setEditorError(null)
-    const r = await openFileInEditor(filePath)
+    const r = isDir ? await openDirInEditor(filePath) : await openFileInEditor(filePath)
     // The bridge always names a reason on failure (bad path, unsupported type,
     // or the OS refusal string), so there is no English fallback to translate.
     if (!r.ok) setEditorError(r.error || 'error')

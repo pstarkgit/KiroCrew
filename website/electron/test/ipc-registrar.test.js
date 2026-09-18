@@ -33,6 +33,7 @@ const SHELL_HANDLES = [
   "browser:track-session",
   "crash-reports:get",
   "crash-reports:reveal",
+  "dashboard:open-dir",
   "dashboard:open-file",
   "global-hotkey:get",
   "local-gateway:get",
@@ -185,6 +186,10 @@ function harness({
   // process state that only holds for the duration of the native launch (the
   // narrowed launcher PATH openPathHardened installs and then restores).
   onOpenPath = null,
+  // The host platform the registrar reads. Pinned to linux by default so a
+  // platform-GATED channel (dashboard:open-dir) behaves identically on every CI
+  // runner instead of only on the one the Electron suite happens to run on.
+  platform = "linux",
   detectWsl = async () => ({
     available: true,
     distros: [],
@@ -353,6 +358,7 @@ function harness({
     backendUrl,
     port,
     detectWsl: runWslDetection,
+    platform,
     crashScan: crashScan === undefined ? undefined : () => {
       crashScans.push(true);
       return typeof crashScan === "function" ? crashScan() : crashScan;
@@ -452,13 +458,13 @@ test("registerShell owns the exact shell channel set and is idempotent", () => {
 
   assert.deepEqual([...h.handlers.keys()].sort(), SHELL_HANDLES);
   assert.deepEqual([...h.listeners.keys()].sort(), SHELL_LISTENERS);
-  assert.equal(h.handlers.size + h.listeners.size, 35);
+  assert.equal(h.handlers.size + h.listeners.size, 36);
 
   // boot-complete is a further non-update host channel, but it is deliberately
   // gateway-owned and scoped to a single connecting WebContents. Registering it
   // globally here would weaken its sender check and leak listeners.
   assert.match(GATEWAY_SOURCE, /ipcMain\.on\("boot-complete", onComplete\)/);
-  assert.equal(h.handlers.size + h.listeners.size + 1, 36);
+  assert.equal(h.handlers.size + h.listeners.size + 1, 37);
   assert.equal(h.handlers.has("boot-complete"), false);
   assert.equal(h.listeners.has("boot-complete"), false);
 
@@ -1024,6 +1030,197 @@ test("dashboard:open-file hardens the launcher PATH across the native launch", a
       assert.equal(observed, before, "non-Linux platforms are a pass-through");
     }
     // Restored afterwards, so the narrowing cannot leak into later spawns.
+    assert.equal(process.env.PATH, before);
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("dashboard:open-dir routes through the shared local-dashboard gate", async () => {
+  // Same hazard as its file sibling: a LAUNCH on the machine running this shell,
+  // so a renderer served by a REMOTE gateway must be rejected before any fs or
+  // shell work happens.
+  const h = harness();
+  h.registrar.registerShell();
+  await assert.rejects(
+    () => h.handlers.get("dashboard:open-dir")(
+      wslEvent("https://remote.example/chat"),
+      "/tmp",
+    ),
+    (error) => {
+      assert.equal(error && error.message, "dashboard:open-dir is restricted to the local dashboard");
+      return true;
+    },
+  );
+  assert.equal(h.shellCalls.length, 0, "a rejected sender must not reach shell.openPath");
+});
+
+test("dashboard:open-dir refuses a platform whose native open is deferred", async () => {
+  // The handler's realpath / not-a-bundle screens judge a path STRING, so they
+  // bind only where the launch resolves that same string inside the call. macOS
+  // and Windows post the open to a worker and re-resolve afterwards, and for a
+  // DIRECTORY the replacement can be a program (a macOS bundle IS a directory),
+  // so the deferred platforms are refused outright rather than handed a check
+  // that does not bind. A real directory is passed, so the refusal is proven to
+  // come from the platform and not from the argument.
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "opendir-"));
+  try {
+    const real = path.join(scratch, "my-project");
+    fs.mkdirSync(real);
+    for (const platform of ["darwin", "win32", "freebsd"]) {
+      const h = harness({ platform });
+      h.registrar.registerShell();
+      assert.deepEqual(
+        await h.handlers.get("dashboard:open-dir")(wslEvent(), real),
+        { ok: false, error: "unsupported platform" },
+        `platform ${platform}`,
+      );
+      assert.equal(
+        h.shellCalls.some(([name]) => name === "openPath"),
+        false,
+        `platform ${platform}: must not reach shell.openPath`,
+      );
+    }
+    // The sender gate still runs FIRST: a remote renderer is rejected rather
+    // than told which platforms are supported.
+    const remote = harness({ platform: "darwin" });
+    remote.registrar.registerShell();
+    await assert.rejects(
+      () => remote.handlers.get("dashboard:open-dir")(
+        wslEvent("https://remote.example/chat"),
+        real,
+      ),
+      (error) => {
+        assert.equal(error && error.message, "dashboard:open-dir is restricted to the local dashboard");
+        return true;
+      },
+    );
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("dashboard:open-dir refuses anything that is not a plain directory", async () => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "opendir-"));
+  try {
+    const plainFile = path.join(scratch, "note.md");
+    fs.writeFileSync(plainFile, "# hi\n");
+    // A macOS PROGRAM BUNDLE is a directory, and shell.openPath LAUNCHES it.
+    // The path can arrive from an agent-authored transcript chip, so both
+    // screens are pinned: the suffix set, and the real `Contents/Info.plist`
+    // predicate for a bundle whose suffix is not on that set.
+    const appBundle = path.join(scratch, "Calculator.app");
+    fs.mkdirSync(appBundle);
+    const installer = path.join(scratch, "Thing.pkg");
+    fs.mkdirSync(installer);
+    const plistBundle = path.join(scratch, "unlisted-suffix.quicklook");
+    fs.mkdirSync(path.join(plistBundle, "Contents"), { recursive: true });
+    fs.writeFileSync(path.join(plistBundle, "Contents", "Info.plist"), "<plist/>");
+    // A symlink NAMED like a folder but resolving to a bundle: realpath runs
+    // before both screens, so it is judged by what it resolves to.
+    const decoy = path.join(scratch, "project");
+    fs.symlinkSync(appBundle, decoy);
+    const missing = path.join(scratch, "nope");
+
+    const cases = [
+      ["", { ok: false, error: "no path" }],
+      [123, { ok: false, error: "no path" }],
+      [plainFile, { ok: false, error: "not a directory" }],
+      [appBundle, { ok: false, error: "not a directory" }],
+      [installer, { ok: false, error: "not a directory" }],
+      [plistBundle, { ok: false, error: "not a directory" }],
+      [decoy, { ok: false, error: "not a directory" }],
+    ];
+    for (const [input, expected] of cases) {
+      const h = harness();
+      h.registrar.registerShell();
+      const result = await h.handlers.get("dashboard:open-dir")(wslEvent(), input);
+      assert.deepEqual(result, expected, `input ${JSON.stringify(input)}`);
+      assert.equal(
+        h.shellCalls.some(([name]) => name === "openPath"),
+        false,
+        `input ${JSON.stringify(input)}: must not reach shell.openPath`,
+      );
+    }
+
+    // A path that does not exist fails in realpathSync and is reported, not thrown.
+    const gone = harness();
+    gone.registrar.registerShell();
+    const goneResult = await gone.handlers.get("dashboard:open-dir")(wslEvent(), missing);
+    assert.equal(goneResult.ok, false);
+    assert.match(goneResult.error, /ENOENT/);
+    assert.match(gone.logs.join("\n"), /dashboard:open-dir refused:/);
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("dashboard:open-dir opens a project directory at its realpath and reports OS refusals", async () => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "opendir-"));
+  try {
+    const real = path.join(scratch, "my-project");
+    fs.mkdirSync(real);
+    const realResolved = fs.realpathSync(real);
+    const link = path.join(scratch, "alias");
+    fs.symlinkSync(real, link);
+
+    // Happy path through a symlink: the OS receives the RESOLVED directory.
+    const ok = harness();
+    ok.registrar.registerShell();
+    assert.deepEqual(await ok.handlers.get("dashboard:open-dir")(wslEvent(), link), { ok: true });
+    assert.deepEqual(lastCall(ok.shellCalls, "openPath").slice(1), [realResolved]);
+
+    // A directory WITH a dot in its name is ordinary, not a bundle — the suffix
+    // screen must not swallow `example.com` or `site.v2`.
+    const dotted = path.join(scratch, "example.com");
+    fs.mkdirSync(dotted);
+    const dottedH = harness();
+    dottedH.registrar.registerShell();
+    assert.deepEqual(await dottedH.handlers.get("dashboard:open-dir")(wslEvent(), dotted), { ok: true });
+
+    // OS refusal: a non-empty openPath return is surfaced, not swallowed.
+    const refused = harness({ openPathResult: "no handler for folders" });
+    refused.registrar.registerShell();
+    assert.deepEqual(
+      await refused.handlers.get("dashboard:open-dir")(wslEvent(), real),
+      { ok: false, error: "no handler for folders" },
+    );
+    assert.match(refused.logs.join("\n"), /dashboard:open-dir: OS refused .* no handler for folders/);
+
+    // A thrown shell.openPath is caught and reported rather than crashing.
+    const threw = harness({ openPathThrows: true });
+    threw.registrar.registerShell();
+    assert.deepEqual(
+      await threw.handlers.get("dashboard:open-dir")(wslEvent(), real),
+      { ok: false, error: "shell.openPath blew up" },
+    );
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+// Same PATH-shadowing hazard as the file launch: on Linux `shell.openPath`
+// forks `xdg-open` by bare name against the inherited PATH, so the directory
+// launch has to go through `openPathHardened` too.
+test("dashboard:open-dir hardens the launcher PATH across the native launch", async () => {
+  const { LINUX_LAUNCHER_PATH } = require("../open-path");
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "opendir-"));
+  try {
+    const real = path.join(scratch, "my-project");
+    fs.mkdirSync(real);
+    const before = process.env.PATH;
+    let observed;
+    const h = harness({ onOpenPath: () => { observed = process.env.PATH; } });
+    h.registrar.registerShell();
+    assert.deepEqual(
+      await h.handlers.get("dashboard:open-dir")(wslEvent(), real),
+      { ok: true },
+    );
+    if (process.platform === "linux") {
+      assert.equal(observed, LINUX_LAUNCHER_PATH);
+    } else {
+      assert.equal(observed, before, "non-Linux platforms are a pass-through");
+    }
     assert.equal(process.env.PATH, before);
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });

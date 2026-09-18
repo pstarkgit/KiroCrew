@@ -8536,6 +8536,7 @@
     "filePathMenu": {
       "copy_failed": "Não foi possível copiar o caminho",
       "copy_path": "Copiar caminho",
+      "open_folder_in_editor": "Abrir a pasta no editor",
       "path_copied": "Caminho copiado",
       "reveal_blocked": "Este caminho está protegido e não pode ser aberto.",
       "reveal_failed": "Não foi possível abrir este caminho na máquina que executa o {{productName}}."
@@ -10245,6 +10246,9 @@
       },
       "filesHome": {
         "no_project_dir": "Nenhum diretório de projeto definido para este chat",
+        "open_project_in_editor": "Abrir o projeto no editor",
+        "open_terminal": "Abrir um terminal no diretório do projeto",
+        "project_actions": "Ações do projeto",
         "refresh": "Atualizar",
         "select_file_hint": "Selecione um arquivo na árvore para abri-lo em uma nova aba",
         "title": "Arquivos",

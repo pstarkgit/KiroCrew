@@ -8,6 +8,7 @@ const {
   LINUX_LAUNCHER_PATH,
   ELECTRON_MAJOR_VERIFIED,
   hardenedLauncherPath,
+  nativeOpenIsSynchronous,
   openPathHardened,
 } = require("../open-path");
 
@@ -36,6 +37,39 @@ describe("hardenedLauncherPath", () => {
     // that reads as protection. null means "leave PATH untouched".
     assert.equal(hardenedLauncherPath("darwin"), null);
     assert.equal(hardenedLauncherPath("win32"), null);
+  });
+});
+
+describe("nativeOpenIsSynchronous", () => {
+  it("is true only on Linux, where the fork happens inside the call", () => {
+    assert.equal(nativeOpenIsSynchronous("linux"), true);
+    // macOS posts the open to a dispatch queue and Windows to a COM STA task
+    // runner, so both re-resolve the path AFTER a caller's checks ran.
+    assert.equal(nativeOpenIsSynchronous("darwin"), false);
+    assert.equal(nativeOpenIsSynchronous("win32"), false);
+  });
+
+  it("is false for an unknown platform, so a new port fails closed", () => {
+    // A caller uses this to decide whether validate-then-launch is sound. An
+    // unrecognised platform has not been verified, and guessing "synchronous"
+    // would silently license the launch it is meant to withhold.
+    assert.equal(nativeOpenIsSynchronous("freebsd"), false);
+    assert.equal(nativeOpenIsSynchronous("sunos"), false);
+    assert.equal(nativeOpenIsSynchronous(""), false);
+    // NOT `undefined`: that takes the default parameter, which is this host's
+    // real `process.platform` -- asserting on it would make the case pass or
+    // fail by runner, and the default is the intended production reading.
+  });
+
+  it("is a SEPARATE question from launcher-PATH hardening", () => {
+    // Both answer "Linux" today, and they state different facts: which launcher
+    // binary is resolved, versus when the path string is resolved. This pins
+    // that they are two functions, so a later change to one cannot silently
+    // redefine the other -- the timing answer is what `dashboard:open-dir`
+    // rests on.
+    assert.notStrictEqual(nativeOpenIsSynchronous, hardenedLauncherPath);
+    assert.equal(typeof nativeOpenIsSynchronous("linux"), "boolean");
+    assert.equal(typeof hardenedLauncherPath("linux"), "string");
   });
 });
 
