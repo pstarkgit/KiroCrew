@@ -44,7 +44,10 @@ from kiro_crew.imaging import (  # noqa: F401 -- constants re-exported, see comm
     MAX_IMAGE_EDGE_PX,
     downscale_image_block,
 )
+from kiro_crew.messaging.outbound_files import iter_local_refs
+from kiro_crew.messaging.split import iter_fence_spans
 from kiro_crew.platform_compat import first_linked_ancestor, is_link_or_junction
+from kiro_crew.widget_parse import mask_inline_code
 
 logger = logging.getLogger(__name__)
 
@@ -247,6 +250,142 @@ def build_prompt_blocks(
             text = text.replace(raw, f"[image: {path.name}]")
 
     return [{"type": "text", "text": text}, *images]
+
+
+#: Stands in for a local image reference in text that is NOT the current turn.
+#:
+#: It deliberately carries neither the path nor the alt text.
+#:
+#: The path is the harmful half twice over. When the file is still readable,
+#: ``build_prompt_blocks`` above re-inlines it -- so a picture an earlier
+#: compaction already dropped comes back at full byte cost, on this turn and on
+#: every later cold start, and the surrounding markdown is left mangled into
+#: ``![alt]([image: name])`` because the substitution rewrites the destination
+#: inside the link. When the file is gone -- a swept temp upload, a pruned
+#: attachment, a sensitive-path refusal, an oversize or undecodable file, which
+#: are five separate ``continue`` branches above -- no image block is emitted at
+#: all and the path is left in the text verbatim.
+#:
+#: The alt text goes too, because a caption is indistinguishable from a
+#: description: a model handed ``![the login error](...)`` with no picture has
+#: prose asserting what the picture showed, which is the behaviour being fixed.
+#:
+#: Distinct from ``[image: <name>]``, which ``build_prompt_blocks`` writes to
+#: mean the OPPOSITE -- that the picture is attached to this very request.
+STRIPPED_IMAGE_MARKER = "[image not carried into this context]"
+
+#: Cheap "could either grammar match at all" pre-test. Every row of every
+#: history build pays this, so the two real scans below must not run unless a
+#: raster suffix is present somewhere in the row.
+_ANY_IMAGE_SUFFIX_RE = re.compile(rf"\.{_SUFFIX_GROUP}", re.IGNORECASE)
+
+#: A bare attachment path STANDS ALONE: it opens the row, or follows whitespace
+#: or an opening delimiter. ``_PATH_RE``'s own ``(?<![\w:/])`` guard only
+#: forbids starting mid-token, which still admits a path embedded in a URL
+#: query -- ``?src=/tmp/a.png`` is preceded by ``=``, which that guard permits.
+#:
+#: ``build_prompt_blocks`` can afford the looser guard because its rewrite is
+#: CONDITIONAL: it edits the text only after it has actually read a file, so an
+#: unreadable URL-embedded path is left exactly as written. A substitution has
+#: no such condition, and rewriting the inside of a URL is corruption rather
+#: than scrubbing. The consequence is stated in :func:`strip_image_refs`.
+_STANDALONE_LEAD_RE = re.compile(r"[\s(\[<\"']")
+
+
+def _mask_code_spans(text: str) -> str:
+    """*text* with fenced blocks and inline code blanked, length preserved.
+
+    Offsets from a scan of the result therefore index straight into *text*.
+    Newlines are kept so the per-line inline pass still sees the real line
+    structure. Both span rules are borrowed rather than re-spelled --
+    ``iter_fence_spans`` is the whole-text view of the splitter's own fence
+    machine, and ``mask_inline_code`` is the shared port of the frontend's
+    balanced-backtick rule -- because a second spelling of either diverges on
+    the next CommonMark fix.
+    """
+    chars = list(text)
+    for start, end in iter_fence_spans(text):
+        for i in range(start, end):
+            if chars[i] != "\n":
+                chars[i] = " "
+    return "\n".join(mask_inline_code(line) for line in "".join(chars).split("\n"))
+
+
+def strip_image_refs(text: str) -> str:
+    """*text* with every local image reference replaced by a content-free marker.
+
+    The inverse of :func:`build_prompt_blocks`, for text that is replayed or
+    recalled HISTORY rather than the current request: a history row names a
+    picture that belonged to an earlier turn, and the two ways that reference
+    can be read are both wrong (see :data:`STRIPPED_IMAGE_MARKER`). Replacing
+    it with a marker is the "fully removed" half of the only two honest
+    options, since a text vehicle cannot carry bytes.
+
+    Both shapes a row can hold are covered, in the order that keeps them from
+    overlapping: markdown ``![alt](dest)`` first, via the same
+    :func:`~kiro_crew.messaging.outbound_files.iter_local_refs` scan the
+    attachment store uses -- which is what the dashboard persists -- and then
+    bare paths, which is what a Slack or Telegram inbound message appends.
+    Doing markdown first means the second pass never sees a destination that
+    was already inside a link.
+
+    The bare-path pass is ``_PATH_RE`` -- shared with the inliner, so the two
+    cannot drift into a path this function leaves behind for that one to pick
+    up -- narrowed by two conditions the inliner does not need, because its
+    rewrite happens only after a file was actually read while a substitution
+    has no such condition:
+
+    * code is masked (:func:`_mask_code_spans`), so a fenced or inline-code
+      path is documentation and stays readable;
+    * the path must stand alone (:data:`_STANDALONE_LEAD_RE`), so a path inside
+      a URL query is left as part of its URL.
+
+    Those two are corruption when rewritten, which is strictly worse than the
+    residue of not rewriting them: a URL-embedded path naming a file that still
+    exists can still be inlined out of a replayed row, exactly as it would be
+    out of the current turn's text on main. Narrowing here does not change that
+    behaviour in either direction.
+
+    Remote and ``data:`` references are left alone, matching
+    ``iter_local_refs``: neither is a local path, so neither is inlined here
+    and a URL stays usable to a tool-capable agent.
+
+    The remaining inherited residue is that ``_PATH_RE`` is platform-gated, so
+    a bare Windows path in a transcript transferred to a POSIX host is not
+    matched -- it is not inlined there either, and the markdown shape is
+    matched on both hosts.
+    """
+    if not isinstance(text, str) or not text or not _ANY_IMAGE_SUFFIX_RE.search(text):
+        return text
+    out = text
+    try:
+        refs = iter_local_refs(out)
+    except Exception:  # pragma: no cover - defensive: a scan must never break a turn
+        logger.debug("acp prompt: image-reference scan failed", exc_info=True)
+        refs = []
+    # Right-to-left, so an earlier reference's span stays valid after a later
+    # one has been replaced -- the same order the attachment store rewrites in.
+    for ref in reversed(refs):
+        out = out[: ref.start] + STRIPPED_IMAGE_MARKER + out[ref.end :]
+    for start, end in reversed(_bare_path_spans(out)):
+        out = out[:start] + STRIPPED_IMAGE_MARKER + out[end:]
+    return out
+
+
+def _bare_path_spans(text: str) -> list[tuple[int, int]]:
+    """Spans of *text* holding a standalone local image path, in order."""
+    try:
+        masked = _mask_code_spans(text)
+    except Exception:  # pragma: no cover - defensive: a scan must never break a turn
+        logger.debug("acp prompt: code-span mask failed", exc_info=True)
+        return []
+    spans: list[tuple[int, int]] = []
+    for match in _PATH_RE.finditer(masked):
+        start = match.start(1)
+        if start > 0 and not _STANDALONE_LEAD_RE.match(text[start - 1]):
+            continue
+        spans.append((start, match.end(1)))
+    return spans
 
 
 #: Block ``type`` values that get a dedicated counter in the structure summary.
