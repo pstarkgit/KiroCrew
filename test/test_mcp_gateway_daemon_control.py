@@ -8,6 +8,12 @@ stops it synchronously, and the doctor shows its code revision beside ours.
 
 from __future__ import annotations
 
+import contextlib
+import json
+import socket
+import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -15,6 +21,8 @@ import pytest
 from kiro_crew import cli_doctor, cli_server, platform_compat
 from kiro_crew.code_fingerprint import code_fingerprint
 from kiro_crew.mcp_gateway import daemon_control as dc
+
+_POSIX_ONLY = pytest.mark.skipif(sys.platform == "win32", reason="AF_UNIX listener")
 
 
 def _pong(**over):
@@ -52,6 +60,216 @@ class TestDescribeDaemon:
         monkeypatch.setattr(platform_compat, "pid_exists", lambda pid: pid == 4242)
         info = dc.describe_daemon(tmp_path / "gw.sock")
         assert info is not None and info.owner_alive is True
+
+
+@contextlib.contextmanager
+def _daemon_on(path: Path, reply: bytes | None, *, chunked: bool = False):
+    """Serve ``reply`` on a REAL endpoint at ``path`` for the duration.
+
+    A real listener rather than a faked transport: the round trip is what these
+    tests are about, and a fake would only assert the author's beliefs about the
+    client back at itself. ``reply=None`` accepts the connection and never
+    answers, which is the hung-daemon case.
+    """
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(path))
+    srv.listen(8)
+    srv.settimeout(0.2)
+    stop = threading.Event()
+
+    def serve() -> None:
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except (TimeoutError, OSError):
+                continue
+            try:
+                conn.recv(4096)
+                if reply is None:
+                    stop.wait(1.0)
+                    continue
+                if chunked:
+                    # A stream hands back whatever is buffered, not whole frames.
+                    for i in range(0, len(reply), 4):
+                        conn.sendall(reply[i : i + 4])
+                        time.sleep(0.002)
+                else:
+                    conn.sendall(reply)
+            except OSError:
+                pass
+            finally:
+                conn.close()
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        t.join(timeout=2)
+        srv.close()
+
+
+@_POSIX_ONLY
+class TestThePingIsARealRoundTrip:
+    """One client answers "is a daemon there", and both callers depend on it.
+
+    Neither can render an inconclusive probe: a ``None`` makes the doctor print
+    "not running" and makes the CLI stop signal nothing, so a probe that cannot
+    ask reports a live daemon as gone and leaves it for the next gateway to
+    adopt. These drive a real listener; the Windows endpoint's own semantics
+    (pipe name, read mode, server-principal check) belong to
+    ``transport.connect`` and are covered in test_mcp_gateway_transport.py.
+    """
+
+    def test_a_live_daemon_is_read_off_the_wire(self, short_sock_dir: Path) -> None:
+        sock = short_sock_dir / "gw.sock"
+        with _daemon_on(sock, json.dumps(_pong(pid=4321)).encode() + b"\n"):
+            info = dc.describe_daemon(sock)
+        assert info is not None and info.pid == 4321
+        assert info.matches_this_code is True
+
+    def test_a_pong_split_across_reads_is_reassembled(self, short_sock_dir: Path) -> None:
+        sock = short_sock_dir / "gw.sock"
+        with _daemon_on(sock, json.dumps(_pong(pid=4321)).encode() + b"\n", chunked=True):
+            info = dc.describe_daemon(sock)
+        assert info is not None and info.pid == 4321
+
+    def test_nothing_listening_is_no_daemon(self, short_sock_dir: Path) -> None:
+        assert dc.describe_daemon(short_sock_dir / "absent.sock") is None
+
+    def test_a_reply_that_is_not_a_pong_is_rejected(self, short_sock_dir: Path) -> None:
+        sock = short_sock_dir / "gw.sock"
+        with _daemon_on(sock, b'{"type":"nope"}\n'):
+            assert dc.describe_daemon(sock) is None
+
+    def test_a_truncated_reply_is_rejected(self, short_sock_dir: Path) -> None:
+        """No newline: readuntil raises IncompleteReadError rather than hanging."""
+        sock = short_sock_dir / "gw.sock"
+        with _daemon_on(sock, b'{"type":"pong"'):
+            assert dc.describe_daemon(sock) is None
+
+    def test_a_daemon_that_accepts_but_never_answers_is_bounded(
+        self, short_sock_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sock = short_sock_dir / "gw.sock"
+        monkeypatch.setattr(dc, "_PING_TIMEOUT_SECS", 0.2)
+        started = time.monotonic()
+        with _daemon_on(sock, None):
+            assert dc.describe_daemon(sock) is None
+        assert time.monotonic() - started < 5.0, "the deadline is the client's"
+
+
+class TestThePingRefusesWhatItCannotAttribute:
+    def test_the_ping_is_not_gated_on_the_platform(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Neither platform short-circuits to ``None`` before asking.
+
+        This is the whole contract: a ``None`` from :func:`_ping` has to mean
+        "nothing answered", because the doctor renders it as "not running" and
+        the CLI stop renders it as nothing to signal. An arm that returns it
+        without connecting reports a live daemon as gone.
+        """
+        reached: list[str] = []
+
+        async def connect(path, **kw):
+            reached.append(str(path))
+            raise FileNotFoundError(2, "nothing listening")
+
+        monkeypatch.setattr(dc.transport, "connect", connect)
+        sock = tmp_path / "gw.sock"
+        for is_windows in (False, True):
+            reached.clear()
+            monkeypatch.setattr(platform_compat, "IS_WINDOWS", is_windows)
+            assert dc._ping(sock) is None
+            assert reached == [str(sock)], f"the client is reached with IS_WINDOWS={is_windows}"
+
+    def test_a_refused_endpoint_is_no_daemon(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """``transport.connect`` refuses a Windows pipe served by another principal.
+
+        It raises ``ConnectionRefusedError`` for that, the same OSError shape as
+        "nothing is listening", and it must stay a refusal here: the pong names
+        the pid and start token :func:`stop_daemon` signals, so an endpoint that
+        cannot be attributed would get to choose the process an operator kills.
+        """
+
+        async def refused(path, **kw):
+            raise ConnectionRefusedError("server principal not confirmed (mismatch)")
+
+        monkeypatch.setattr(dc.transport, "connect", refused)
+        killed: list[int] = []
+        monkeypatch.setattr(
+            platform_compat, "kill_pid_pinned", lambda pid, start, sig: killed.append(pid) or True
+        )
+        assert dc.describe_daemon(tmp_path / "gw.sock") is None
+        assert dc.stop_daemon(tmp_path / "gw.sock", wait_secs=0.0) == "absent"
+        assert killed == [], "an unattributable endpoint directs no signal"
+
+    @pytest.mark.asyncio
+    async def test_a_caller_inside_a_loop_is_reported_not_crashed(self, tmp_path: Path) -> None:
+        """``asyncio.run`` refuses to nest; the never-raises contract holds."""
+        assert dc._ping(tmp_path / "gw.sock") is None
+
+
+class TestTheWindowsStopPathIsReachable:
+    """Everything under the gate -- the WMI argv check, the handle-pinned kill.
+
+    The client is one shared implementation, so what is platform-specific here is
+    the SIGNAL half: Windows skips the pre-signal start-time read because
+    ``kill_pid_pinned`` holds the identity open across the kill instead.
+    """
+
+    def _windows_daemon(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+        monkeypatch.setattr(dc, "_ping", lambda p: _pong(pid=9999))
+        monkeypatch.setattr(
+            platform_compat,
+            "process_command_line",
+            lambda pid: "python.exe -m kiro_crew.mcp_gateway.gatewayd",
+        )
+        monkeypatch.setattr(dc.transport, "singleton_lock_free", lambda p: True)
+        monkeypatch.setattr(platform_compat, "pid_exists", lambda pid: False)
+
+    def test_a_live_daemon_is_signalled_not_reported_away(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        self._windows_daemon(monkeypatch)
+        sent: list[tuple[int, str, int]] = []
+        monkeypatch.setattr(
+            platform_compat,
+            "kill_pid_pinned",
+            lambda pid, start, sig: sent.append((pid, start, sig)) or True,
+        )
+        assert dc.stop_daemon(tmp_path / "gw.sock", wait_secs=1.0) == "stopped"
+        assert sent == [(9999, "1000", platform_compat.SIGTERM)]
+
+    def test_the_cli_stop_reports_the_daemon_it_took_down(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        """``absent`` has no print arm, so silence there means nothing was found."""
+        self._windows_daemon(monkeypatch)
+        monkeypatch.setattr(dc, "configured_socket_path", lambda: tmp_path / "gw.sock")
+        monkeypatch.setattr(platform_compat, "kill_pid_pinned", lambda pid, start, sig: True)
+        cli_server._stop_mcp_gateway_daemon()
+        assert "Stopped the MCP gateway daemon" in capsys.readouterr().out
+
+    def test_the_doctor_reports_the_revision(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        """The in-app diagnosis an operator needs: which daemon, whose code."""
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+        monkeypatch.setattr(dc, "_ping", lambda p: _pong(pid=9999, fingerprint="old-checkout"))
+        monkeypatch.setattr(dc, "configured_socket_path", lambda: tmp_path / "gw.sock")
+        monkeypatch.setattr(platform_compat, "pid_exists", lambda pid: True)
+        issues: list[str] = []
+        cli_doctor._doctor_mcp_gateway_daemon(issues)
+        out = capsys.readouterr().out
+        assert "not running" not in out
+        assert "old-checkout" in out and "pid 9999" in out
+        assert issues == ["MCP gateway daemon runs a different code revision than this install"]
 
 
 class TestConfiguredSocketPath:
