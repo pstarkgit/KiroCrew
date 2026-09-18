@@ -5384,8 +5384,15 @@ class VectorMemoryStore:
                 return True
         return False
 
-    def get_lessons(self, limit: int | None = None) -> list[dict]:
-        """Return lesson.* entries ordered by most recently updated."""
+    def get_lessons(self, limit: int | None = None, offset: int = 0) -> list[dict]:
+        """Return lesson.* entries ordered by most recently updated.
+
+        ``offset`` skips that many of the NEWEST rows and is honoured only with
+        a positive ``limit``: it exists so a paging reader (``GET /api/lessons``)
+        can walk back through the population one bounded window at a time
+        without materializing the rows it skips. The unbounded read has nothing
+        to page and ignores it.
+        """
         sql = (
             "SELECT * FROM semantic_memory "
             "WHERE is_deleted = 0 AND key LIKE 'lesson.%' "
@@ -5397,8 +5404,8 @@ class VectorMemoryStore:
         # connection. _db_lock is reentrant, so callers that already hold it
         # remain safe.
         if limit is not None and limit > 0:
-            sql += " LIMIT ?"
-            rows = self._fetch_all_locked(sql, (limit,))
+            sql += " LIMIT ? OFFSET ?"
+            rows = self._fetch_all_locked(sql, (limit, max(0, offset)))
         else:
             # Unbounded: the whole lesson population, which is what the
             # _stored_similarity_scorer callers (_rank_lessons,
