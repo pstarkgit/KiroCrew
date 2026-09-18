@@ -188,6 +188,24 @@ describe('KiroAccountModal', () => {
     expect(screen.queryByLabelText('Checking credit usage')).not.toBeInTheDocument()
   })
 
+  it('tells the user to sign in again instead of blaming the opted-out scrape', async () => {
+    // 'signin-required' is terminal until the user re-authenticates (#11602). It
+    // must NOT render the scrape-disabled copy: that asserts the free API
+    // returned no plan for this account (it was never called) and points at a
+    // knob whose billed /usage turn needs the same lapsed sign-in, so acting on
+    // it spends credits on attempts that cannot succeed.
+    renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage="signin-required" />)
+
+    expect(await screen.findByText(/Sign in to Kiro again/)).toBeInTheDocument()
+    // The remedy the user must not be sent to.
+    expect(
+      screen.queryByText(/Set dashboard\.usage_text_scrape_enabled to true/),
+    ).not.toBeInTheDocument()
+    expect(screen.queryByText('Credit usage unavailable')).not.toBeInTheDocument()
+    expect(screen.queryByText('Checking account…')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Checking credit usage')).not.toBeInTheDocument()
+  })
+
   it('calls onClose from the accessible close control', async () => {
     const onClose = vi.fn()
     renderWithProviders(

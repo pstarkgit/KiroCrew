@@ -24,7 +24,7 @@ export type { KiroBonusCreditGrant, KiroCreditUsage }
  * value that means "still loading" — the others have nothing more to wait for,
  * so spinning on them would repeat the defect this distinction exists to remove.
  */
-export type KiroAccountUsage = KiroCreditUsage | null | 'none' | 'failed' | 'api-key' | 'scrape-disabled'
+export type KiroAccountUsage = KiroCreditUsage | null | 'none' | 'failed' | 'api-key' | 'scrape-disabled' | 'signin-required'
 
 /** True only for an actual reading, so the sentinels cannot reach a field access. */
 const isUsageReading = (usage: KiroAccountUsage): usage is KiroCreditUsage =>
@@ -240,9 +240,11 @@ function CreditUsage({ usage }: { usage: KiroAccountUsage }) {
         <AlertCircle className="lucide-inline shrink-0" />{' '}
         {i18nT(usage === 'api-key'
           ? 'components.kiroAccountModal.credit_usage_api_key_auth'
-          : usage === 'scrape-disabled'
-            ? 'components.kiroAccountModal.credit_usage_scrape_disabled'
-            : 'components.kiroAccountModal.credit_usage_unavailable')}
+          : usage === 'signin-required'
+            ? 'components.kiroAccountModal.credit_usage_signin_required'
+            : usage === 'scrape-disabled'
+              ? 'components.kiroAccountModal.credit_usage_scrape_disabled'
+              : 'components.kiroAccountModal.credit_usage_unavailable')}
       </div>
     )
   }
