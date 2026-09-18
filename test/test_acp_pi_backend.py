@@ -33,6 +33,7 @@ import re
 import shutil
 import subprocess
 import textwrap
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -40,6 +41,7 @@ import pytest
 from kiro_crew.acp import client as acp_client
 from kiro_crew.acp._dispatch import GATE_ENVELOPE_MARKER, build_permission_event, gate_envelope
 from kiro_crew.acp.client import (
+    _READBACK_STDERR_EXCERPT_CHARS,
     PI_ACP_BIN,
     PI_BIN,
     PI_GATE_EXTENSION_SHA256,
@@ -51,6 +53,7 @@ from kiro_crew.acp.client import (
     _ensure_pi_gate_launcher,
     _pi_commands_from_readback,
     _pi_gate_launcher_body,
+    _readback_stderr_excerpt,
     _resolve_pi_acp_bin,
     _resolve_pi_bin,
     _seal_pi_gate_extension,
@@ -713,6 +716,116 @@ class TestTheReadBackComparesFilesNotStrings:
         assert "_same_file_spelling(extension_path)" in source
 
 
+#: A 40-char run of the base64 alphabet: the AWS secret-access-key shape the
+#: redactors' bare-secret detector is built for. Not a real key.
+_AWS_SECRET_SHAPE = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+
+class TestTheReadBackStderrExcerpt:
+    """The excerpt travels into an operator-facing refusal, so it is bounded."""
+
+    def test_nothing_to_report_is_the_empty_string(self):
+        for empty in ("", "   ", "\n\t\r", None, 7):
+            assert _readback_stderr_excerpt(empty) == ""
+
+    def test_the_tail_is_kept_because_the_failure_is_written_last(self):
+        """A harness prints its banner first and fails last."""
+        banner = "pi 0.85.1 starting up. " * 200
+        stderr = banner + "/bin/sh: pi: Permission denied"
+        excerpt = _readback_stderr_excerpt(stderr)
+        assert "Permission denied" in excerpt
+        assert excerpt.startswith("...")
+
+    def test_the_excerpt_is_bounded(self):
+        excerpt = _readback_stderr_excerpt("x" * 50_000)
+        assert len(excerpt) <= _READBACK_STDERR_EXCERPT_CHARS + len("...")
+
+    def test_control_characters_never_reach_a_terminal_or_a_log(self):
+        """A raw escape sequence in a refusal can rewrite what an operator sees."""
+        excerpt = _readback_stderr_excerpt(
+            "\x1b[2J\x1b[1;31mred\x1b[0m\r\nsecond line\x00\x07 done"
+        )
+        assert excerpt == "[2J [1;31mred [0m second line done"
+        assert not any(unicodedata.category(ch).startswith("C") for ch in excerpt)
+
+    def test_a_short_message_is_passed_through_whole(self):
+        assert (
+            _readback_stderr_excerpt("/bin/sh: /Users/me/.local/bin/pi: Permission denied\n")
+            == "/bin/sh: /Users/me/.local/bin/pi: Permission denied"
+        )
+
+    def test_a_secret_suppresses_the_whole_excerpt(self):
+        """Fail closed: no diagnosis beats a credential in an operator-facing string."""
+        assert _readback_stderr_excerpt(f"auth failed for key={_AWS_SECRET_SHAPE}") == ""
+
+    def test_a_secret_split_by_a_separator_also_suppresses_it(self):
+        """The bare-secret patterns need a contiguous run, so a split hides one.
+
+        A wrap newline or a NUL dropped into a 40-char key leaves two fragments
+        neither pattern matches, and publishing them with a space inserted
+        publishes every character of the key. Both spellings are checked, so the
+        joined one sees it and the excerpt is withheld.
+
+        The separator families are covered together because they fail for two
+        different reasons: category C and Z characters are split points that
+        ``str.split()`` would turn into one space in BOTH spellings, while the
+        zero-width ones do not split a token at all yet still break the run.
+        """
+        separators = {
+            "LF (Cc)": "\n",
+            "CR (Cc)": "\r",
+            "NUL (Cc)": "\x00",
+            "ESC (Cc)": "\x1b",
+            "TAB (Cc)": "\t",
+            "VT (Cc)": "\v",
+            "LINE SEPARATOR (Zl)": "\u2028",
+            "PARAGRAPH SEPARATOR (Zp)": "\u2029",
+            "NO-BREAK SPACE (Zs)": "\xa0",
+            "OGHAM SPACE MARK (Zs)": "\u1680",
+            "IDEOGRAPHIC SPACE (Zs)": "\u3000",
+            "ZERO WIDTH SPACE (Cf)": "\u200b",
+            "WORD JOINER (Cf)": "\u2060",
+            "SOFT HYPHEN (Cf)": "\xad",
+            "plain space (Zs)": " ",
+        }
+        for label, sep in separators.items():
+            split = _AWS_SECRET_SHAPE[:18] + sep + _AWS_SECRET_SHAPE[18:]
+            excerpt = _readback_stderr_excerpt(f"error: key={split} rejected")
+            assert excerpt == "", f"{label} leaked: {excerpt!r}"
+            assert _AWS_SECRET_SHAPE[:18] not in excerpt
+
+    def test_every_separator_the_splitter_breaks_on_is_classified(self):
+        """The removal set must not drift from ``str.split()``'s own predicate.
+
+        Scanned over the whole BMP rather than a hand-listed sample: a character
+        ``split()`` breaks on that this function does not rewrite is a split point
+        present in both spellings, which is exactly the shape that published a
+        secret whole.
+        """
+        missed = [
+            hex(cp)
+            for cp in range(0x110000)
+            if chr(cp).isspace() and not acp_client._is_child_output_separator(chr(cp))
+        ]
+        assert missed == []
+
+    def test_a_secret_split_at_every_offset_suppresses_it(self):
+        """No offset inside the run is a hole, including the first and last."""
+        for cut in range(1, len(_AWS_SECRET_SHAPE)):
+            split = _AWS_SECRET_SHAPE[:cut] + "\n" + _AWS_SECRET_SHAPE[cut:]
+            assert _readback_stderr_excerpt(f"key={split}") == "", f"leaked at cut {cut}"
+
+    def test_an_ordinary_failure_is_not_suppressed_by_the_secret_check(self):
+        """The check must not swallow the message this exists to deliver."""
+        for line in (
+            "/bin/sh: /Users/me/.local/bin/pi: Permission denied",
+            "/bin/sh: /Users/me/.local/bin/pi: bad interpreter: No such file or directory",
+            "pi: unknown flag --extension",
+            "env: node: No such file or directory",
+        ):
+            assert _readback_stderr_excerpt(line) == line
+
+
 class TestTheReadBackReportsFailureRatherThanAssuming:
     """A read-back that could not run must never read as "loaded"."""
 
@@ -733,10 +846,69 @@ class TestTheReadBackReportsFailureRatherThanAssuming:
         class _Completed:
             returncode = 3
             stdout = ""
+            stderr = ""
 
         monkeypatch.setattr(acp_client.subprocess_mod, "run", lambda *_a, **_kw: _Completed())
         issue, remedy = self._client(tmp_path)._verify_pi_gate(self.ARGV, self.EXT)
         assert "exit 3" in issue and "get_commands" in remedy
+
+    def test_the_childs_own_reason_reaches_the_refusal(self, tmp_path, monkeypatch):
+        """An exit code alone names a verdict, not a cause.
+
+        The launcher is /bin/sh exec'ing the resolved harness binary, so the shell's
+        own sentence is what tells an exec the OS refused apart from a shebang it
+        cannot resolve. The refusal carries it.
+        """
+
+        class _Completed:
+            returncode = 126
+            stdout = ""
+            stderr = "/bin/sh: /Users/me/.local/bin/pi: Permission denied\n"
+
+        monkeypatch.setattr(acp_client.subprocess_mod, "run", lambda *_a, **_kw: _Completed())
+        issue, _remedy = self._client(tmp_path)._verify_pi_gate(self.ARGV, self.EXT)
+        assert "exit 126" in issue
+        assert "Permission denied" in issue
+
+    def test_a_silent_child_is_reported_as_the_bare_exit(self, tmp_path, monkeypatch):
+        """No placeholder: "the child said nothing" must not look like "Crew hid it"."""
+
+        class _Completed:
+            returncode = 126
+            stdout = ""
+            stderr = "   \n\t\n"
+
+        monkeypatch.setattr(acp_client.subprocess_mod, "run", lambda *_a, **_kw: _Completed())
+        issue, _remedy = self._client(tmp_path)._verify_pi_gate(self.ARGV, self.EXT)
+        assert issue.endswith("(exit 126)")
+
+    def test_a_response_that_never_came_still_reports_the_childs_reason(
+        self, tmp_path, monkeypatch
+    ):
+        """A zero exit with no parseable answer is the other half of the same path."""
+
+        class _Completed:
+            returncode = 0
+            stdout = "not json at all"
+            stderr = "pi: unknown flag --extension\n"
+
+        monkeypatch.setattr(acp_client.subprocess_mod, "run", lambda *_a, **_kw: _Completed())
+        issue, _remedy = self._client(tmp_path)._verify_pi_gate(self.ARGV, self.EXT)
+        assert "no response" in issue
+        assert "unknown flag" in issue
+
+    def test_a_secret_in_the_childs_stderr_is_not_republished(self, tmp_path, monkeypatch):
+        """A refusal reaches the dashboard and the chat card; the child is foreign."""
+
+        class _Completed:
+            returncode = 126
+            stdout = ""
+            stderr = f"config error: key={_AWS_SECRET_SHAPE} rejected\n"
+
+        monkeypatch.setattr(acp_client.subprocess_mod, "run", lambda *_a, **_kw: _Completed())
+        issue, _remedy = self._client(tmp_path)._verify_pi_gate(self.ARGV, self.EXT)
+        assert _AWS_SECRET_SHAPE not in issue
+        assert issue.endswith("(exit 126)"), "a secret withholds the excerpt, not just the secret"
 
     def test_a_registry_without_the_gate_is_refused_with_the_gate_remedy(
         self, tmp_path, monkeypatch
@@ -744,6 +916,7 @@ class TestTheReadBackReportsFailureRatherThanAssuming:
         class _Completed:
             returncode = 0
             stdout = _response(_registry(("compact", None)))
+            stderr = ""
 
         monkeypatch.setattr(acp_client.subprocess_mod, "run", lambda *_a, **_kw: _Completed())
         issue, remedy = self._client(tmp_path)._verify_pi_gate(self.ARGV, self.EXT)
@@ -756,6 +929,7 @@ class TestTheReadBackReportsFailureRatherThanAssuming:
         class _Completed:
             returncode = 0
             stdout = _response(_registry((PROBE, self.EXT)))
+            stderr = ""
 
         def _fake_run(argv, **kwargs):
             seen["argv"] = argv
@@ -780,6 +954,7 @@ class TestTheReadBackReportsFailureRatherThanAssuming:
         class _Completed:
             returncode = 0
             stdout = _response(_registry((PROBE, self.EXT)))
+            stderr = ""
 
         def _fake_run(argv, **kwargs):
             seen["env"] = kwargs["env"]
@@ -803,6 +978,7 @@ class TestTheReadBackReportsFailureRatherThanAssuming:
         class _Completed:
             returncode = 0
             stdout = _response(_registry((PROBE, self.EXT)))
+            stderr = ""
 
         def _fake_run(argv, **kwargs):
             seen["env"] = kwargs["env"]

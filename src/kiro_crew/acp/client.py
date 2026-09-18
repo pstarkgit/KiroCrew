@@ -30,6 +30,7 @@ import subprocess as subprocess_mod
 import sys
 import tempfile
 import time
+import unicodedata
 import uuid
 from collections import deque
 from contextlib import aclosing, suppress
@@ -1268,6 +1269,103 @@ def _opencode_uniform_permission(raw: object) -> object:
             return values.pop()
         return json.dumps(raw, sort_keys=True)
     return None
+
+
+#: How much of a refused read-back child's stderr reaches the operator.
+#: The excerpt lands in a refusal that is shown in the dashboard, sent to the chat
+#: card and pasted into bug reports, while the child is a foreign harness binary
+#: that can print a stack trace or a screenful of banner. Enough for the one line
+#: that names the cause (``/bin/sh: /path/to/pi: Permission denied`` is 44), not
+#: enough to turn a refusal into a log dump.
+_READBACK_STDERR_EXCERPT_CHARS = 400
+
+
+def _is_child_output_separator(ch: str) -> bool:
+    """Whether *ch* is a character :func:`_flatten_child_output` must rewrite.
+
+    Two clauses, and both are load-bearing:
+
+    * ``str.isspace()`` is the AUTHORITATIVE half, because it is the predicate
+      ``str.split()`` itself uses to choose split points. The joined spelling
+      exists to rejoin a run some character interrupted, so the set it removes has
+      to be the set the splitter would break on -- derived from the splitter rather
+      than hand-listed beside it, or the two drift. A hand-listed category ``C``
+      test missed ``U+2028``/``U+2029``/``U+00A0`` (categories ``Zl``/``Zp``/``Zs``)
+      exactly that way: neither spelling removed them, ``split()`` turned each into
+      one space in BOTH, and a secret they interrupted was published whole.
+    * Categories ``C`` and ``Z`` add the invisibles ``str.isspace()`` does NOT
+      report -- ``U+200B`` ZERO WIDTH SPACE and ``U+2060`` WORD JOINER are ``Cf``
+      and answer ``False`` -- which do not split a token but do break the
+      redactors' contiguous-run patterns just as effectively.
+    """
+    return ch.isspace() or unicodedata.category(ch).startswith(("C", "Z"))
+
+
+def _flatten_child_output(text: str, control: str) -> str:
+    """*text* with every separator character replaced by *control*.
+
+    Whitespace runs are collapsed, so the result is one line. ``control`` is the
+    two spellings :func:`_readback_stderr_excerpt` has to consider: a space keeps
+    the words apart, an empty string rejoins whatever the separator interrupted.
+    :func:`_is_child_output_separator` decides what counts.
+    """
+    return " ".join(
+        "".join(control if _is_child_output_separator(ch) else ch for ch in text).split()
+    )
+
+
+def _readback_stderr_excerpt(stderr: object) -> str:
+    """One bounded, scrubbed, single-line excerpt of a read-back child's stderr.
+
+    A gate read-back that fails reports its child's exit code AND the child's own
+    account of why. The exit code alone names a verdict without a cause: on the pi
+    read-back the launcher is ``/bin/sh`` exec'ing the resolved harness binary, so
+    ``exit 126`` is the shell's EACCES-on-exec, and only the shell's sentence
+    separates an exec the OS refused (``Permission denied``) from a shebang it
+    cannot resolve (``bad interpreter``). Those are different faults with different
+    fixes, and the child is the only party that knows which one happened. The
+    refusal already travels to the operator, so it carries the sentence that makes
+    it actionable.
+
+    Three properties, each load-bearing:
+
+    * The **TAIL**, not the head. A harness writes its banner first and fails last,
+      so a head excerpt reports the banner and drops the diagnosis, which is the
+      one thing this exists to deliver.
+    * **Nothing secret-shaped is published, in ANY spelling of the text.** The
+      redactors' bare-secret patterns need a contiguous ``[A-Za-z0-9+/]{40,}`` run,
+      and a separator dropped inside one -- a wrap newline, a NUL, an ANSI
+      introducer, ``U+2028``, a no-break space, a zero-width space -- splits a
+      40-char AWS secret key into two fragments that neither pattern matches.
+      Replacing the separator with a space does not close that (the split survives,
+      and every character of the key would be published with one space inserted);
+      deleting it instead only moves the hole, because joining can equally destroy
+      a label anchor the spaced spelling would have matched. So BOTH spellings go
+      to the redactors and the excerpt is emitted only when NEITHER carries
+      anything they flag. When either does, the caller reports the bare exit code:
+      no diagnosis, which is what this path offers when a child is silent, and
+      never a credential. The child is a foreign harness binary writing arbitrary
+      bytes, so this fails closed rather than reasoning about how likely such a run
+      is. :func:`_is_child_output_separator` is what the two spellings differ on,
+      and it is derived from ``str.split()``'s own predicate for that reason.
+    * **Bounded last**, at :data:`_READBACK_STDERR_EXCERPT_CHARS`, so the cut is
+      taken from text the redactors have already cleared rather than from a token
+      that could be halved.
+
+    Non-strings, blank stderr, and stderr whose redaction is ambiguous answer
+    ``""``.
+    """
+    if not isinstance(stderr, str) or not stderr:
+        return ""
+    spaced = _flatten_child_output(stderr, " ")
+    if not spaced:
+        return ""
+    for spelling in (spaced, _flatten_child_output(stderr, "")):
+        if _scrub_observed(spelling) != spelling:
+            return ""
+    if len(spaced) > _READBACK_STDERR_EXCERPT_CHARS:
+        return "..." + spaced[-_READBACK_STDERR_EXCERPT_CHARS:]
+    return spaced
 
 
 def _scrub_observed(value: object) -> object:
@@ -5428,9 +5526,15 @@ class AcpClient:
                 _opencode_readback_remedy(),
             )
         if completed.returncode != 0:
+            # The child's own reason, same as the pi read-back below: an operator
+            # reading this refusal learns both that the harness failed and what it
+            # said about why.
+            detail = f"exit {completed.returncode}"
+            excerpt = _readback_stderr_excerpt(completed.stderr)
+            if excerpt:
+                detail = f"{detail}: {excerpt}"
             return (
-                "the resolved configuration could not be read back "
-                f"(exit {completed.returncode})",
+                f"the resolved configuration could not be read back ({detail})",
                 _opencode_readback_remedy(),
             )
         # The harness prints a banner before the document, so the object is found
@@ -5521,6 +5625,13 @@ class AcpClient:
         commands = _pi_commands_from_readback(completed.stdout)
         if commands is None:
             detail = f"exit {completed.returncode}" if completed.returncode != 0 else "no response"
+            # The child's OWN account of what went wrong. The launcher is /bin/sh
+            # exec'ing the resolved harness binary, so its stderr is what separates
+            # an exec the OS refused from a shebang that cannot be resolved -- a
+            # distinction the exit code alone cannot carry.
+            excerpt = _readback_stderr_excerpt(completed.stderr)
+            if excerpt:
+                detail = f"{detail}: {excerpt}"
             return (
                 f"the harness's command registry could not be read back ({detail})",
                 _pi_readback_remedy(),
