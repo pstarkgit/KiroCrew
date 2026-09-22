@@ -28,7 +28,13 @@ documents its knobs in its own spec — `session_summary` is the current example
 `SkillsConfig` established: every field carries `_meta` label/help for the config
 surfaces, out-of-range values are clamped with a warning rather than raising, and
 a malformed section degrades to defaults so a hand-edited file cannot prevent the
-gateway from starting.
+gateway from starting. `jev.shadow_enabled` is the same shape for a local-only
+flag that must not spend tokens: default off, exact `true` to enable, details in
+[jev-shadow.md](jev-shadow.md). `JevConfig` is a post-split section DTO, so
+`KiroCrewConfig.jev` is annotated with the bare class name (aliased from
+`config.sections`, not added to the frozen loader `ImportFrom` snapshot). Schema
+generation and `test_config_schema` resolve annotations in `sections.py`; a
+qualified `_sections.JevConfig` annotation cannot recurse to `jev.shadow_enabled`.
 
 ## Embedding rebuild request publication
 

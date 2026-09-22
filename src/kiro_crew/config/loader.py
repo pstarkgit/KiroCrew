@@ -378,6 +378,12 @@ from kiro_crew.stt.limits import MIN_SILENCE_MS as _STT_MIN_SILENCE_MS
 from kiro_crew.stt.limits import MIN_TIMEOUT_SECS as _STT_MIN_TIMEOUT_SECS
 from kiro_crew.stt.models import DEFAULT_MODEL as _STT_DEFAULT_MODEL
 
+# Bare names for post-split DTOs on KiroCrewConfig. Schema generation and
+# test_config_schema resolve annotations in sections.py, so a qualified
+# `_sections.JevConfig` annotation cannot recurse to `jev.shadow_enabled`.
+# Keep these off the frozen ImportFrom snapshot above.
+JevConfig = _sections.JevConfig
+
 logger = logging.getLogger(__name__)
 
 # Credential keys loaded from .env / environment
@@ -3617,6 +3623,14 @@ def _build_session_summary_config(session_summary_data: dict) -> SessionSummaryC
     )
 
 
+def _build_jev_config(jev_data: dict) -> JevConfig:
+    # Security off-switch: only an exact JSON/Python True enables. A string
+    # "true" or 1 must not become truthy through bool().
+    return JevConfig(
+        shadow_enabled=jev_data.get("shadow_enabled", False) is True,
+    )
+
+
 @dataclass
 class KiroCrewConfig:
     agent: AgentConfig = field(
@@ -3660,6 +3674,13 @@ class KiroCrewConfig:
         metadata=_meta(
             "Session Summary",
             "Intent-level session summaries for the chat right panel. Off by default.",
+        ),
+    )
+    jev: JevConfig = field(
+        default_factory=JevConfig,
+        metadata=_meta(
+            "Jev",
+            "Local-only Jev shadow sidecar for redacted session summaries. Off by default.",
         ),
     )
     telemetry: TelemetryConfig = field(
@@ -4344,6 +4365,7 @@ class KiroCrewConfig:
         tunnel_data = _coerced_section(data, "tunnel", _degraded)
         skills_data = _coerced_section(data, "skills", _degraded)
         session_summary_data = _coerced_section(data, "session_summary", _degraded)
+        jev_data = _coerced_section(data, "jev", _degraded)
         messaging_data = _coerced_section(data, "messaging", _degraded)
         telemetry_data = _coerced_section(data, "telemetry", _degraded)
         orchestrator_data = _coerced_section(data, "orchestrator", _degraded)
@@ -4580,6 +4602,7 @@ class KiroCrewConfig:
             heartbeat=HeartbeatConfig(default_deliver=heartbeat_default_deliver),
             skills=_build_skills_config(skills_data),
             session_summary=_build_session_summary_config(session_summary_data),
+            jev=_build_jev_config(jev_data),
             slack_channels={
                 ch_id: ChannelConfig.from_dict(ch_data)
                 for ch_id, ch_data in (
@@ -4830,6 +4853,7 @@ class KiroCrewConfig:
             "heartbeat": asdict(self.heartbeat),
             "skills": asdict(self.skills),
             "session_summary": asdict(self.session_summary),
+            "jev": asdict(self.jev),
             "telemetry": asdict(self.telemetry),
             "snapshot_dir": self.snapshot_dir,
             "timezone": self.timezone,

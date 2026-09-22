@@ -252,6 +252,12 @@ surface as a failed turn, and the previous cached summary stays valid.
 On success, `push_session_summary()` broadcasts `{"_type": "session_summary"}` so
 the panel invalidates immediately rather than polling.
 
+After the sidecar write succeeds, the pass may invoke the local Jev shadow
+hook (`observe_session_summary`) when `jev.shadow_enabled` is exactly `true`.
+That hook is documented in [jev-shadow.md](jev-shadow.md): default off, bounded
+local receipt only, fail-open for this generator, fail-closed for Jev, and it
+must not change the stored summary or the panel payload.
+
 `_broadcast` must carry a **typed** WS branch for it — `{"type":
 "session_summary", "data": {"key": ...}}`. This is not cosmetic: the generic
 `notification` fallback rewrites the envelope as `{"type": "notification"}`, and
@@ -467,3 +473,4 @@ addition later; if one is ever added it must be registered inline in
 | `test_session_summary_storage.py` | Sidecar round-trip, invalidation, transcript-untouched, delete reaping |
 | `test_session_summary_generate.py` | Gating, caching, failure containment, prompt trap coverage |
 | `test_session_summary_api.py` | Status codes, error `code`, stale flag, never-generates |
+| `test_jev_shadow_session_summary.py` | Post-generation Jev hook: disabled is inert, enabled writes one bounded local receipt, failures do not drop the summary |

@@ -529,6 +529,14 @@ execution; member management and existing V1 bindings remain available.
 |-----|-------------|---------|
 | `session_summary.enabled` | Generate intent-level summaries for the chat side panel after turns. This consumes model tokens; unchanged sessions are served from cache | `false` |
 
+### Jev shadow sidecar
+
+Config-file only; not a Settings card and not the Decisions (Jev) preview.
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `jev.shadow_enabled` | After a session summary is stored, write a bounded local shadow receipt for the already-redacted summary. Does not call a provider or change skills, memory, routing, or cron. Only the JSON boolean `true` enables | `false` |
+
 ### Knowledge Library
 
 | Key | Description | Default |

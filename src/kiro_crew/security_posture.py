@@ -1777,6 +1777,13 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # request sends back — so the only safe answer is not to serve that deck at
         # all. Nothing is emitted here; the app's egress path is decks.py/routes.py.
         "apps/builtins/pptx_maker/backend/paths.py",
+        # Same predicate shape: `evaluate_shadow` compares
+        # `redact_payload(plain) != plain` and rejects `unredacted_secret`.
+        # Callers must already have redacted; this seam will not clean and
+        # continue. Nothing is emitted to a human or third party — the only
+        # write is a bounded local receipt under the data home with no payload
+        # strings — so this is local validation, not an egress boundary.
+        "jev/shadow.py",
         # Redacts INBOUND attacker-controllable provider metadata before it is
         # stored/displayed — a sanitizer on the way in, not an output boundary.
         "dashboard/handlers/mcp_discover.py",

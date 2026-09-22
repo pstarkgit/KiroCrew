@@ -24,6 +24,7 @@ from kiro_crew.acp.types import STOP_REASON_END_TURN
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard.chat_utils import slot_history_key
 from kiro_crew.history import is_incognito_transcript
+from kiro_crew.jev.shadow import observe_session_summary
 from kiro_crew.llm_helpers import _extract_json_of_type, run_bg_oneliner
 from kiro_crew.session_summary import (
     count_user_turns,
@@ -228,6 +229,22 @@ def _parse_reply(text: str) -> object:
     return data
 
 
+async def _observe_jev_shadow(cfg: KiroCrewConfig, key: str, payload: dict[str, Any]) -> None:
+    """Best-effort local shadow after a summary is stored. Never raises."""
+    enabled = getattr(getattr(cfg, "jev", None), "shadow_enabled", False) is True
+    if enabled is not True:
+        return
+    try:
+        await asyncio.to_thread(
+            observe_session_summary,
+            enabled=True,
+            session_key=key,
+            payload=payload,
+        )
+    except Exception:
+        logger.debug("Session summary: jev shadow sidecar failed")
+
+
 async def generate_session_summary(
     state: DashboardState,
     slot: _ChatSlot,
@@ -419,6 +436,9 @@ async def _generate_locked(
         len(payload["intents"]),
         user_turns,
     )
+    # Local Jev shadow: default-off, never raises into this pass, never sends
+    # the summary off-box. A receipt cannot change what was just stored.
+    await _observe_jev_shadow(cfg, key, payload)
     # Notify with the SLOT key, not the transcript key used for storage.
     # Two identifiers for two purposes: the sidecar is keyed to the
     # transcript file, while a UI notification has to carry the identifier

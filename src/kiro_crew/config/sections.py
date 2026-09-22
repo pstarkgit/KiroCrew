@@ -4127,6 +4127,27 @@ class SessionSummaryConfig:
 
 
 @dataclass
+class JevConfig:
+    """Local-only Jev shadow sidecar. Off by default; no provider call.
+
+    This is not the Decisions (Jev) settings card. Enabling the flag stores a
+    bounded local receipt after a session summary is written; it does not call a
+    model, and a receipt never drives skills, memory, routing, or cron.
+    """
+
+    shadow_enabled: bool = field(
+        default=False,
+        metadata=_meta(
+            "Jev Shadow Sidecar",
+            "When true, after a session summary is stored, emit a bounded local "
+            "shadow receipt for the already-redacted summary. Default off. Does not "
+            "call a provider, does not change product behavior, and is not the "
+            "Decisions (Jev) preview card.",
+        ),
+    )
+
+
+@dataclass
 class TelemetryConfig:
     """Metrics telemetry settings (Wave 0 trunk).
 

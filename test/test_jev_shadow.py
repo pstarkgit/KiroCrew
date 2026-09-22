@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections.abc import Mapping as AbcMapping
 from pathlib import Path
 
 from kiro_crew.jev import (
@@ -138,6 +139,28 @@ class TestMalformedAndRawRejection:
         payload["extra"] = "nope"
         receipt = evaluate_shadow(_request(enabled=True, payload=payload))
         assert receipt.reason == REASON_MALFORMED_PAYLOAD
+
+    def test_generation_envelope_keys_are_admitted(self):
+        payload = _summary_payload()
+        payload.update(
+            {
+                "generated_at": 1.5,
+                "user_turns": 3,
+                "last_activity": "2026-08-10T10:00:00+00:00",
+                "sig": 1760000000.5,
+                "gen": 3,
+            }
+        )
+        receipt = evaluate_shadow(_request(enabled=True, payload=payload))
+        assert receipt.status == STATUS_SHADOWED
+        assert receipt.accepted is True
+
+    def test_nested_stowaway_under_envelope_key_is_malformed(self):
+        payload = _summary_payload()
+        payload["generated_at"] = {"hidden": "nope"}
+        receipt = evaluate_shadow(_request(enabled=True, payload=payload))
+        assert receipt.reason == REASON_MALFORMED_PAYLOAD
+        assert receipt.accepted is False
 
     def test_raw_messages_are_rejected(self):
         receipt = evaluate_shadow(
@@ -311,3 +334,71 @@ class TestNoSideEffects:
                 )
             )
         assert _UNIQUE_MARKER not in caplog.text
+
+
+class _InfiniteMapping(AbcMapping):
+    """Untrusted Mapping whose keys never end."""
+
+    def __getitem__(self, key):
+        return "x"
+
+    def __iter__(self):
+        i = 0
+        while True:
+            yield str(i)
+            i += 1
+
+    def __len__(self):
+        return 10**9
+
+    def keys(self):
+        return self
+
+    def items(self):
+        for key in self:
+            yield key, self[key]
+
+    def values(self):
+        while True:
+            yield "x"
+
+    def get(self, key, default=None):
+        return default
+
+
+class TestUntrustedPayloadBounds:
+    def test_cyclic_mapping_is_malformed_not_a_crash(self):
+        payload = {}
+        payload["intents"] = [payload]
+        receipt = evaluate_shadow(_request(enabled=True, payload=payload))
+        assert receipt.accepted is False
+        assert receipt.status == STATUS_REJECTED
+        assert receipt.reason == REASON_MALFORMED_PAYLOAD
+        assert receipt.result is None
+
+    def test_cyclic_list_under_intent_is_malformed_not_a_crash(self):
+        payload = _summary_payload()
+        cycle: list = []
+        cycle.append(cycle)
+        payload["intents"][0]["progress"] = cycle
+        receipt = evaluate_shadow(_request(enabled=True, payload=payload))
+        assert receipt.accepted is False
+        assert receipt.status == STATUS_REJECTED
+        assert receipt.reason in {REASON_MALFORMED_PAYLOAD, REASON_OVERSIZE}
+        assert receipt.result is None
+
+    def test_deeply_nested_mapping_is_oversize_not_a_crash(self):
+        nested: dict = {"title": "ok"}
+        for _ in range(64):
+            nested = {"title": "ok", "progress": [nested]}
+        receipt = evaluate_shadow(_request(enabled=True, payload={"intents": [nested]}))
+        assert receipt.accepted is False
+        assert receipt.status == STATUS_REJECTED
+        assert receipt.reason in {REASON_MALFORMED_PAYLOAD, REASON_OVERSIZE}
+
+    def test_infinite_mapping_keys_are_oversize_not_a_hang(self):
+        receipt = evaluate_shadow(_request(enabled=True, payload=_InfiniteMapping()))
+        assert receipt.accepted is False
+        assert receipt.status == STATUS_REJECTED
+        assert receipt.reason in {REASON_MALFORMED_PAYLOAD, REASON_OVERSIZE}
+        assert receipt.result is None

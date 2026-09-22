@@ -7,6 +7,7 @@ from kiro_crew.jev.shadow import (
     JevShadowRequest,
     enabled_from_mapping,
     evaluate_shadow,
+    observe_session_summary,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "JevShadowRequest",
     "enabled_from_mapping",
     "evaluate_shadow",
+    "observe_session_summary",
 ]
