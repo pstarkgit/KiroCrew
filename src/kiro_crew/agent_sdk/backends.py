@@ -232,6 +232,14 @@ ACP_BACKEND_GOOSE = "goose"
 # closure -- so one global install is the whole precondition, with no workspace
 # checkout and no per-profile dependency step.
 ACP_BACKEND_DEEPSEEK = "deepseek"
+# Strands Harness: a Python agent framework serving ACP v1 over stdio via the
+# ``strands-acp`` binary (``pip install strands-harness strands-agents``). Backed by
+# Strands SDK + ``KIROCREW_STRANDS_MCP_SERVERS`` (same JSON format as Pi's env var).
+# System prompt: ~415 tokens (``HARNESS_CONTRACT`` only) vs 30k–50k for Claude Code.
+# Routing is ``UNVERIFIED`` pending a ``session/request_permission`` implementation in
+# strands-acp; the backend is known and launchable but absent from the selectable
+# baseline until that arrives.
+ACP_BACKEND_STRANDS = "strands"
 # The kiro-cli backend is spelled as the empty string throughout, so name it
 # rather than leaving every call site to infer it from "not claude".
 ACP_BACKEND_KIRO = ""
@@ -249,6 +257,7 @@ ACP_BACKENDS_KNOWN: FrozenSet[str] = frozenset(
         ACP_BACKEND_PI,
         ACP_BACKEND_GOOSE,
         ACP_BACKEND_DEEPSEEK,
+        ACP_BACKEND_STRANDS,
     }
 )
 
@@ -503,6 +512,7 @@ POLICY_ID_BY_BACKEND: dict = {
     ACP_BACKEND_PI: ACP_BACKEND_PI,
     ACP_BACKEND_GOOSE: ACP_BACKEND_GOOSE,
     ACP_BACKEND_DEEPSEEK: ACP_BACKEND_DEEPSEEK,
+    ACP_BACKEND_STRANDS: ACP_BACKEND_STRANDS,
 }
 
 #: The backend a deployment policy may never deny.
@@ -1086,6 +1096,7 @@ ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION = frozenset(
         ACP_BACKEND_PI,
         ACP_BACKEND_GOOSE,
         ACP_BACKEND_DEEPSEEK,
+        ACP_BACKEND_STRANDS,
     }
 )
 
@@ -1208,6 +1219,10 @@ ACP_BACKENDS_ADVERTISED_MODEL_SELECTION = frozenset(
         ACP_BACKEND_PI,
         ACP_BACKEND_GOOSE,
         ACP_BACKEND_DEEPSEEK,
+        # strands-acp advertises its model select on ``session/new`` configOptions; the ids
+        # are Anthropic model strings, but they live in the ``strands`` registry bucket so a
+        # pick lands on the right vocabulary and does not collide with claude-agent-acp.
+        ACP_BACKEND_STRANDS,
     }
 )
 
@@ -1276,6 +1291,12 @@ _MODEL_REGISTRY_NAMESPACE_BY_BACKEND: dict = {
     # other harness spells, so a shared bucket would offer the picker ids that only
     # one backend can accept.
     ACP_BACKEND_DEEPSEEK: "deepseek",
+    # strands gets its own key: its ids are Anthropic model strings, but they should
+    # not share the ``claude_code`` bucket (which carries versioned ``[1m]`` suffixes)
+    # or the ``acp`` bucket (which carries kiro-family ids). Its own bucket keeps the
+    # picker vocabulary per-harness even though the bare model name is the same across
+    # backends.
+    ACP_BACKEND_STRANDS: "strands",
 }
 
 
@@ -1430,6 +1451,9 @@ ACP_BACKENDS_HARNESS_OWNED_SESSIONS = frozenset(
         ACP_BACKEND_PI,
         ACP_BACKEND_GOOSE,
         ACP_BACKEND_DEEPSEEK,
+        # strands-acp keeps its session map in process memory (``_sessions`` dict);
+        # Crew does not own the session and cannot replay it from its own store.
+        ACP_BACKEND_STRANDS,
     }
 )
 
@@ -1599,6 +1623,12 @@ ACP_BACKEND_ROUTING: dict = {
     # setting that governs escalations and assert a routing guarantee nothing
     # performs, which is the one thing this table exists to prevent.
     ACP_BACKEND_DEEPSEEK: Routing.UNVERIFIED,
+    # strands is ``UNVERIFIED`` pending a ``session/request_permission`` implementation
+    # in ``strands-acp``. The adapter currently auto-approves all tool calls; adding a
+    # permission channel (seed ``STRANDS_ACP_MODE=approve``, pause before each tool,
+    # emit the permission notification, wait for Crew's response) would promote this to
+    # ``VERIFIED_SEEDED_SETTINGS`` and unlock selectable-baseline membership.
+    ACP_BACKEND_STRANDS: Routing.UNVERIFIED,
 }
 
 
@@ -1745,6 +1775,18 @@ ACP_BACKEND_LAUNCH: Mapping[str, SelfServedLaunch] = {
         missing_hint=(
             "The ACP plugin package alone does not serve ACP: it is a plugin, and "
             "this binary is the host that boots the profile it lives in."
+        ),
+    ),
+    ACP_BACKEND_STRANDS: SelfServedLaunch(
+        label="Strands Harness",
+        binary="strands-acp",
+        acp_args=(),
+        bin_env_var="STRANDS_ACP_BIN",
+        install_command="pip install strands-harness strands-agents",
+        protocol_version=1,
+        missing_hint=(
+            "Install both packages: strands-harness supplies the ACP server and "
+            "HARNESS_CONTRACT, strands-agents supplies the SDK the server runs."
         ),
     ),
 }
