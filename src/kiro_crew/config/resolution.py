@@ -78,6 +78,7 @@ _KNOWN_CONFIG_SECTIONS: frozenset = frozenset(
         "heartbeat",
         "skills",
         "session_summary",
+        "jev",
         "telemetry",
         "snapshot_dir",
         "timezone",
