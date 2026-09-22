@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "strands-acp"
+version = "0.1.0"
+description = "Strands Harness as a Kiro Crew ACP backend"
+requires-python = ">=3.11"
+dependencies = [
+    "strands-harness>=0.1.0",
+    "strands-agents>=0.1.0",
+]
+
+[project.scripts]
+strands-acp = "strands_acp:main"
+
+[tool.setuptools.packages.find]
+where = ["."]

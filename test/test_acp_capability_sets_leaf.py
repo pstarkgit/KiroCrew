@@ -39,6 +39,7 @@ from kiro_crew.acp_backends import (
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
+    ACP_BACKEND_STRANDS,
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_COMPACT,
@@ -183,6 +184,9 @@ def test_membership_is_unchanged_by_the_move() -> None:
             ACP_BACKEND_PI,
             ACP_BACKEND_GOOSE,
             ACP_BACKEND_DEEPSEEK,
+            # strands-acp advertises its model select on session/new configOptions; the ids
+            # are Anthropic model strings living in their own ``strands`` registry bucket.
+            ACP_BACKEND_STRANDS,
         }
     )
     assert ACP_BACKENDS_SEED_LOCAL_SETTINGS == frozenset({ACP_BACKEND_CLAUDE})
