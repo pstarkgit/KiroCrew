@@ -51,6 +51,7 @@ from kiro_crew.acp.client import (
     _ensure_pi_gate_launcher,
     _pi_commands_from_readback,
     _pi_gate_launcher_body,
+    _pi_gate_sandbox_expose,
     _resolve_pi_acp_bin,
     _resolve_pi_bin,
     _seal_pi_gate_extension,
@@ -871,7 +872,42 @@ def test_the_read_back_child_is_sandbox_wrapped_with_the_adapter_mask() -> None:
     readback_at = body.find("_verify_pi_gate")
     assert wrap_at != -1 and wrap_at < readback_at
     assert "extra_hidden_dirs=adapter_hidden_dirs" in body
+    assert "extra_expose_files=adapter_expose" in body
     assert "readback_cleanup" in body
+
+
+def test_pi_gate_sandbox_expose_is_exactly_the_two_verified_files(tmp_path) -> None:
+    """The carve-out is the launcher and the sealed source, never their directory."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    launcher = str(run_dir / "kirocrew_pi_gate.sh")
+    sealed = str(run_dir / "kirocrew_pi_gate.ts")
+    prior = ("/home/user/.aws/config",)
+    exposed = _pi_gate_sandbox_expose(prior, launcher, sealed)
+    assert exposed == (*prior, launcher, sealed)
+    assert str(run_dir) not in exposed
+    assert exposed.count(launcher) == 1
+    assert exposed.count(sealed) == 1
+
+
+def test_the_narrow_gate_file_expose_is_shared_by_readback_and_session_spawn() -> None:
+    """One assignment, both wraps: no directory unmask, preflight still first."""
+    body = _pi_arm()
+    preflight_at = body.find("_sandbox_preflight")
+    launcher_at = body.find("_ensure_pi_gate_launcher")
+    expose_at = body.find("_pi_gate_sandbox_expose")
+    wrap_at = body.find("wrap_argv_async")
+    readback_at = body.find("_verify_pi_gate")
+    assert -1 not in (preflight_at, launcher_at, expose_at, wrap_at, readback_at)
+    assert preflight_at < launcher_at < expose_at < wrap_at < readback_at
+    assert "extra_visible_dirs" not in body
+    assert (
+        "_pi_gate_run_dir()"
+        not in body.split("_pi_gate_sandbox_expose", 1)[1].split("wrap_argv_async", 1)[0]
+    )
+    spawn = inspect.getsource(AcpClient._spawn)
+    assert spawn.count("extra_expose_files=adapter_expose") >= 2
+    assert spawn.count("_pi_gate_sandbox_expose") == 1
 
 
 def test_the_read_back_runs_exactly_what_the_adapter_will_spawn() -> None:

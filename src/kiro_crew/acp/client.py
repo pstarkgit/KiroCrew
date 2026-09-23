@@ -1079,7 +1079,9 @@ def _seal_pi_gate_extension() -> str:
     Reads the packaged file, refuses unless its SHA-256 is
     :data:`PI_GATE_EXTENSION_SHA256`, and writes the verified bytes to a read-only
     file in the owner-only sandbox run directory -- the directory the agent's file
-    tools are fenced from and every sandbox tier exposes for exec. The copy is
+    tools are fenced from. The enforced-adapter credential mask hides that
+    directory, so the spawn re-exposes this file (and the launcher) through
+    :func:`_pi_gate_sandbox_expose` rather than unmasking ``run/``. The copy is
     rewritten whenever its bytes differ from the verified ones, so a copy touched
     between spawns is replaced rather than loaded. Cached per process and inputs
     like the launcher.
@@ -1148,11 +1150,13 @@ def _ensure_pi_gate_launcher(pi_bin: str, extension_path: str) -> str:
     """Write (once per process and inputs) the launcher and return its path.
 
     Lives in the sandbox run directory -- the same owner-only directory the sandbox
-    launchers live in, which every sandbox tier exposes to the child because the
-    child has to exec a launcher out of it. Written under a unique ``mkstemp`` name
-    that is published to the cache only after the write and the mode change have
-    finished, so a concurrent spawn never reads a half-written file, and cached so
-    N sessions share one launcher rather than leaving N files behind.
+    launchers live in. The enforced-adapter credential mask hides that directory
+    (``run/`` is a secret leaf), so the spawn re-exposes this file through
+    :func:`_pi_gate_sandbox_expose` rather than lifting the mask. Written under a
+    unique ``mkstemp`` name that is published to the cache only after the write and
+    the mode change have finished, so a concurrent spawn never reads a half-written
+    file, and cached so N sessions share one launcher rather than leaving N files
+    behind.
 
     Blocking (writes a file); callers run it off the loop.
     """
@@ -1176,6 +1180,22 @@ def _ensure_pi_gate_launcher(pi_bin: str, extension_path: str) -> str:
         raise
     _pi_gate_launcher_cache[key] = tmp
     return tmp
+
+
+def _pi_gate_sandbox_expose(
+    adapter_expose: tuple[str, ...], launcher: str, extension_path: str
+) -> tuple[str, ...]:
+    """Return *adapter_expose* plus the two verified Pi gate files.
+
+    The enforced-adapter credential mask includes the crew ``run/`` directory,
+    which is where the sealed extension and the launcher live. Re-exposing
+    exactly those two paths -- never the directory -- lets the sandboxed
+    read-back (and the session spawn that shares this tuple) load the gate while
+    the rest of ``run/`` stays hidden. Callers assign the result back onto
+    ``adapter_expose`` after :func:`_ensure_pi_gate_launcher` and before either
+    ``wrap_argv_async``.
+    """
+    return (*adapter_expose, launcher, extension_path)
 
 
 def _pi_readback_remedy() -> str:
@@ -7170,6 +7190,12 @@ class AcpClient:
             self._pi_gate_nonce = uuid.uuid4().hex
             self._pi_gate_launcher = await asyncio.to_thread(
                 _ensure_pi_gate_launcher, pi_bin, extension_path
+            )
+            # The credential mask hides ``run/``. Re-expose exactly the two
+            # verified files the read-back and the session must open; the rest
+            # of the directory stays masked. Same tuple is handed to both wraps.
+            adapter_expose = _pi_gate_sandbox_expose(
+                adapter_expose, self._pi_gate_launcher, extension_path
             )
             # Wrapped in the SAME sandbox with the SAME credential mask as the
             # session spawn below, for the same reason the opencode read-back is:
