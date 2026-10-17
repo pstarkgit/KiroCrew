@@ -202,6 +202,7 @@ class _ChatSlot:
         "_fallback_candidate_idx",
         "_fallback_walked",
         "_active_fallback_model",
+        "_fallback_restore_after",
         "_fallback_primary_model",
         "_fallback_slot_model",
         "_model_pick_gen",
@@ -503,6 +504,7 @@ class _ChatSlot:
     _fallback_candidate_idx: int
     _fallback_walked: list[str]
     _active_fallback_model: str
+    _fallback_restore_after: float
     _fallback_primary_model: str
     _fallback_slot_model: str
     _fallback_pick_gen: int

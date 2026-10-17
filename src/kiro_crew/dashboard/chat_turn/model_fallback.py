@@ -5,6 +5,7 @@ verdict."""
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -131,7 +132,7 @@ def _sync_served_model(slot: Any, client: Any) -> None:
     record(str(getattr(client, "served_model", "") or ""))
 
 
-async def _fallback_swap_for_turn(slot: Any, client: Any) -> str | None:
+async def _fallback_swap_for_turn(slot: Any, client: Any, *, reason: str = "throttle-exhaustion") -> str | None:
     """Move the slot's live session onto the next usable fallback candidate.
 
     Called from the interactive error ladder once the same-model transient
@@ -174,7 +175,11 @@ async def _fallback_swap_for_turn(slot: Any, client: Any) -> str | None:
             primary=slot._fallback_primary_model or "",
         )
         candidate = await advance_fallback_candidate(
-            client, fb_state, surface="dashboard", log_suffix=f", slot={slot.key}"
+            client,
+            fb_state,
+            surface="dashboard",
+            log_suffix=f", slot={slot.key}",
+            reason=reason,
         )
         slot._fallback_candidate_idx = fb_state.pos
         if candidate is None:
@@ -183,6 +188,7 @@ async def _fallback_swap_for_turn(slot: Any, client: Any) -> str | None:
         # follow it, or an inheriting slot keeps naming the primary.
         _sync_served_model(slot, client)
         if not slot._fallback_primary_model:
+            slot._fallback_restore_after = 0.0
             slot._fallback_primary_model = fb_state.primary
             # Snapshot slot.model and the explicit-pick generation at activation.
             # The generation is what tells a LATER genuine user pick (drop sticky
@@ -299,6 +305,7 @@ async def _probe_fallback_restore_for_slot_locked(slot: Any, client: Any) -> Non
         # comparison an alias's explicit re-pick of the substitute would be
         # silently overwritten by this restore. Mirrors the refusal path.
         stale=slot._model_pick_gen != slot._fallback_pick_gen or _epoch_moved,
+        restore_after=slot._fallback_restore_after,
         clear=lambda: _clear_fallback_sticky_state(slot, client),
         on_restored=_heal_backfilled_slot_model,
         log_suffix=f", slot={slot.key}",
@@ -332,6 +339,7 @@ def _clear_fallback_sticky_state(slot: Any, client: Any) -> None:
         logger.debug("clearing fallback marker failed; keeping slot state for retry", exc_info=True)
         return
     slot._active_fallback_model = ""
+    slot._fallback_restore_after = 0.0
     slot._fallback_primary_model = ""
     slot._fallback_slot_model = ""
 

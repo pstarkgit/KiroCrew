@@ -134,6 +134,9 @@ def init_ladder_fields(self: _ChatSlot) -> None:
     self._fallback_candidate_idx = 0
     self._fallback_walked = []
     self._active_fallback_model = ""
+    # A spent provider allowance should not be probed on every patrol
+    # turn. Epoch seconds; zero means the ordinary next-turn restore probe.
+    self._fallback_restore_after = 0.0
     self._fallback_primary_model = ""
     # Snapshot of slot.model taken when the fallback activated; it heals
     # slot.model if the automatic provider backfill wrote the fallback id

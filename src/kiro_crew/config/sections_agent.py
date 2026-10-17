@@ -44,6 +44,20 @@ from kiro_crew.effort import EFFORT_LEVELS
 logger = logging.getLogger("kiro_crew.config.loader")
 
 
+def coerce_fallback_models(raw: object) -> list[str]:
+    """Normalize an ordered list of explicit throttle-fallback models."""
+    if not isinstance(raw, list):
+        return []
+    models: list[str] = []
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            spelling = item.strip()
+            model = model_registry.to_provider_id(spelling, "acp") or spelling
+            if model not in models:
+                models.append(model)
+    return models
+
+
 def coerce_fallback_model(raw: object) -> str:
     """Normalize the throttle-fallback model (agent.fallback_model).
 
@@ -126,6 +140,13 @@ class AgentConfig:
             "64 entries are read, and an invalid entry is ignored with a warning. "
             "Empty by default: a model with no window of its own keeps the "
             "1,000,000-token reference. Takes effect on the next config reload.",
+        ),
+    )
+    fallback_models: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Ordered fallback models",
+            "Ordered models tried after a zero-activity usage limit or exhausted transient retry budget.",
         ),
     )
     fallback_model: str = field(
@@ -1265,6 +1286,7 @@ class AgentConfig:
         # Same defensive coercion for the throttle-fallback model: normalize to
         # ""/"auto"/acp id, so consumers can trust the stored shape.
         self.fallback_model = coerce_fallback_model(self.fallback_model)
+        self.fallback_models = coerce_fallback_models(self.fallback_models)
         # And for the content-filter fallback model — same shapes, junk
         # collapses to "" (off) rather than "auto".
         self.refusal_fallback_model = coerce_refusal_fallback_model(self.refusal_fallback_model)

@@ -2918,6 +2918,7 @@ class RunEventCoordinator(ManagerComponent):
             # session lives on the provider via TURN_FALLBACK_ATTR.
             _fb_state = FallbackState(configured_fallback_chain())
             msg = full_message
+            empty_completions = 0
             while True:
                 usage.begin(client)
                 # A new prompt starts with nothing in flight. A call the last
@@ -2925,6 +2926,11 @@ class RunEventCoordinator(ManagerComponent):
                 # in-flight set and be handed the slot when a later call returns.
                 self._manager._clear_tool_dispatch(info)
                 try:
+                    from kiro_crew.acp.types import (
+                        EVENT_THINKING_CHUNK,
+                        EVENT_TOOL_CALL_UPDATE,
+                    )
+
                     if not use_session_sharing:
                         # Publish the live dedicated PID before every prompt,
                         # including retries after a provider process replacement.
@@ -2950,6 +2956,8 @@ class RunEventCoordinator(ManagerComponent):
                     # scope's shared schedule, and the refused call re-issued
                     # by a continuation on the same session.
                     _withheld: LLMEvent | None = None
+                    _empty_completion: LLMEvent | None = None
+                    _turn_productive = False
                     _infra: Any = None
                     stream = (
                         client.stream(msg)
@@ -2957,6 +2965,15 @@ class RunEventCoordinator(ManagerComponent):
                         else client.stream(msg, timeout=prompt_timeout)
                     )
                     async for _ev in stream:
+                        if not _ev.runtime_global and _ev.kind in (
+                            EVENT_TEXT_CHUNK,
+                            EVENT_THINKING_CHUNK,
+                            EVENT_TOOL_CALL,
+                            EVENT_TOOL_CALL_UPDATE,
+                            EVENT_TOOL_RESULT,
+                            EVENT_PERMISSION_REQUEST,
+                        ):
+                            _turn_productive = True
                         if not _ev.runtime_global:
                             # A frame addressed to THIS session: the run's own
                             # turn exists, so the durable row is ``running`` and
@@ -2998,7 +3015,47 @@ class RunEventCoordinator(ManagerComponent):
                                 _withheld = _ev
                                 _infra = _last_infra
                                 continue
+                            # pi-acp turns a provider error into an ordinary
+                            # empty end_turn. Withhold it only while the run
+                            # has no text, thought, or tool activity to replay.
+                            if (
+                                _stop_c.is_success
+                                and not _turn_productive
+                                and not result_text
+                                and turns == 0
+                                and info.tool_count == 0
+                                and not info.user_stopped
+                                and not info._reap_started
+                                and not self._manager._shutting_down
+                                and _fb_state.chain
+                            ):
+                                _empty_completion = _ev
+                                continue
                         yield _ev
+                    if _empty_completion is not None and _withheld is None:
+                        if empty_completions == 0:
+                            empty_completions = 1
+                            msg = full_message
+                            continue
+                        candidate = await advance_fallback_candidate(
+                            client,
+                            _fb_state,
+                            surface="subagent",
+                            log_suffix=f", id={info.id}",
+                            reason="empty-response",
+                        )
+                        if candidate is not None:
+                            defer_fallback_restore(client)
+                            empty_completions = 0
+                            msg = full_message
+                            await self._manager._fire_event(
+                                "subagent_retrying",
+                                info,
+                                {"fallback_model": candidate, "reason": "empty-response"},
+                            )
+                            continue
+                        yield _empty_completion
+                        return
                     if _withheld is None:
                         return
                     # Preserve this turn's billing before recovery can cancel
@@ -3022,7 +3079,8 @@ class RunEventCoordinator(ManagerComponent):
                     raise
                 except Exception as exc:
                     usage.settle()
-                    if not acp_error_is_transient(exc):
+                    _usage_limit = bool(getattr(exc, "usage_limit", False))
+                    if not acp_error_is_transient(exc) and not _usage_limit:
                         raise
                     # Post-activity: continue instead of re-running. "Activity"
                     # is ANY text chunk, approved tool turn, or auto-allowed
@@ -3031,6 +3089,8 @@ class RunEventCoordinator(ManagerComponent):
                     # re-run it (duplicate writes/messages). Only a turn with
                     # zero observed activity resends the original prompt.
                     _had_activity = bool(result_text) or turns > 0 or info.tool_count > 0
+                    if _usage_limit and _had_activity:
+                        raise
                     # The one continue is spent and the backend still fails to
                     # generate after real output: end the stream and keep that
                     # output (flagged below) instead of failing a run that answered.
@@ -3073,7 +3133,7 @@ class RunEventCoordinator(ManagerComponent):
                         if post_activity_attempts >= 1:
                             raise
                         post_activity_attempts += 1
-                    elif attempts >= TRANSIENT_RETRIES:
+                    elif _usage_limit or attempts >= TRANSIENT_RETRIES:
                         # ── Throttle-exhaustion fallback chain ──
                         # Zero-activity budget spent: walk agent.fallback_model
                         # before surfacing (empty chain ⇒ raise exactly as
@@ -3083,12 +3143,13 @@ class RunEventCoordinator(ManagerComponent):
                         # llm_helpers Case 2.75 for the rationale.
                         if not _fb_state.chain:
                             raise
-                        if not _fb_state.should_retry_active():
+                        if _usage_limit or not _fb_state.should_retry_active():
                             _cand = await advance_fallback_candidate(
                                 client,
                                 _fb_state,
                                 surface="subagent",
                                 log_suffix=f", id={info.id}",
+                                reason="usage-limit" if _usage_limit else "throttle-exhaustion",
                             )
                             if _cand is None:
                                 _story = _fb_state.exhaustion_story()
@@ -3104,6 +3165,8 @@ class RunEventCoordinator(ManagerComponent):
                                     except Exception:
                                         pass
                                 raise
+                            if _usage_limit:
+                                defer_fallback_restore(client)
                         _fb_delay = transient_retry_delay(1)
                         await self._manager._fire_event(
                             "subagent_retrying",

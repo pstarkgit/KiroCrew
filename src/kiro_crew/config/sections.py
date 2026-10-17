@@ -106,6 +106,7 @@ from kiro_crew.config.sections_agent import (  # noqa: F401
     AgentConfig,
     _read_skip_permissions,
     coerce_fallback_model,
+    coerce_fallback_models,
     yolo_duration_to_secs,
 )
 from kiro_crew.config.sections_agent_env import (  # noqa: F401
