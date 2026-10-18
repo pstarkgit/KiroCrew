@@ -1392,6 +1392,19 @@ def build_permission_event(
     # AcpEvent.child_mcp_identity_trusted.
     _mcp_identity_trusted = _cached_server is not None and _cached_tool is not None
 
+    if envelope is not None and isinstance(envelope.get("title"), str) and envelope["title"]:
+        # Gate-extension envelope (pi: the only VERIFIED_GATE_EXTENSION backend):
+        # the title is the harness's own tool name, verified by the nonce + the
+        # dialog-title match in gate_envelope(), the same provenance the cached
+        # tool_call kind has. The preceding tool_call frame names no _meta identity
+        # (pi stamps none), so the caches above carry ""/""
+        # -- which the read-only builtin check would read as "identifies nothing".
+        # Substitute the envelope's tool name as the trusted builtin identity (no
+        # server behind it); hooks decides whether that name is read-only.
+        _mcp_server_name = ""
+        _tool_name = envelope["title"]
+        _mcp_identity_trusted = True
+
     # The path the preceding tool_call's diff CONTENT BLOCK named, cached by the
     # same scoped toolCallId as the params. An edit backend may stream trusted
     # ``rawInput`` with no path key at all and name the target only in the

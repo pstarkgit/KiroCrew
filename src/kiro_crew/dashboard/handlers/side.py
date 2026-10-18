@@ -19,7 +19,7 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew.acp.client import AcpAuthRequired
-from kiro_crew.acp_backends import ACP_BACKENDS_SIDE_READONLY
+from kiro_crew.acp_backends import ACP_BACKEND_PI, ACP_BACKENDS_SIDE_READONLY
 from kiro_crew.agent_discovery import warm_project_agent_names
 from kiro_crew.config.loader import (
     KiroCrewConfig,
@@ -477,7 +477,18 @@ async def _run_side_turn(
         # runs the pre-allowance posture: the base agent under REJECT_ALL, and
         # the prompt and fallback say tools are unavailable here.
         tools_available = side_backend is not None and side_backend in ACP_BACKENDS_SIDE_READONLY
-        if tools_available:
+        if tools_available and side_backend == ACP_BACKEND_PI:
+            # Pi needs no derived spec: its gate extension asks about EVERY tool
+            # call (no allowedTools/autoApprove bypass exists), so every call
+            # reaches the READ_ONLY gate below with no pre-approval surface to
+            # close. The side session runs under the resolved agent with
+            # READ_ONLY; the gate auto-approves pi's read-only builtins
+            # (read/grep/find/ls, read-only bash via is_read_only_bash) and
+            # rejects everything else, with a SEL row per decision.
+            side_agent = kiro_agent or slot_agent
+            approval_policy = ToolApprovalPolicy.READ_ONLY
+            binding = (side_agent or "", project or "", "pi_readonly_gate")
+        elif tools_available:
             # The side session runs under ``<agent>--readonly``: the resolved
             # agent's spec with every backend-side grant emptied
             # (``allowedTools: []``, no ``autoApprove``, no ``toolsSettings``

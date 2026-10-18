@@ -1363,7 +1363,7 @@ def _configure_backend(monkeypatch, backend: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_side_turn_grants_read_only_tools_only_on_the_kiro_backend(
+async def test_side_turn_on_kiro_derives_the_read_only_spec(
     tmp_path, monkeypatch, _published_readonly_spec
 ):
     """On kiro-cli (``ACP_BACKENDS_SIDE_READONLY``) the turn derives the read-only
@@ -1441,3 +1441,41 @@ async def test_side_turn_on_another_backend_runs_no_tools_and_derives_nothing(
     last = [d for t, d in events if d.get("role") == "assistant" and d.get("final")][-1]
     assert "can't use tools on this agent backend" in last["content"]
     assert parent._side.binding == (created[0]["agent"] or "", "", "reject_all")
+
+
+@pytest.mark.asyncio
+async def test_side_turn_on_pi_runs_read_only_without_deriving_a_spec(
+    tmp_path, monkeypatch, _published_readonly_spec
+):
+    """Pi is in ``ACP_BACKENDS_SIDE_READONLY`` via its gate extension, not a
+    derived spec: the extension asks about every tool call, so there is no
+    pre-approval bypass to close. The turn binds the resolved (base) agent and
+    streams READ_ONLY, and the prompt offers lookups."""
+    from kiro_crew.acp_backends import ACP_BACKEND_PI
+    from kiro_crew.llm_helpers import ToolApprovalPolicy
+
+    _configure_backend(monkeypatch, ACP_BACKEND_PI)
+    state = _make_state(tmp_path)
+    _capture_broadcasts(state)
+    parent = state.get_or_create_slot("parent")
+    parent._side = SideState(open=True, created_at="2026-01-01T00:00:00Z")
+    parent._side.append_user(_SIDE_QUESTION)
+    parent._side.last_run_id = "run-pi"
+    parent._side.is_complete = False
+    created: list[dict] = []
+
+    async def _fake_get_or_create(key, **kwargs):
+        created.append(kwargs)
+        return MagicMock(), True, False
+
+    state.sessions.get_or_create = _fake_get_or_create
+    state.sessions.release = MagicMock()
+    stream_mock = AsyncMock(return_value=_SIDE_ANSWER)
+    monkeypatch.setattr("kiro_crew.dashboard.handlers.side.stream_and_collect", stream_mock)
+
+    await _run_side_turn(state, parent, "run-pi", _SIDE_QUESTION, is_first_turn=True)
+
+    assert _published_readonly_spec == [], "pi needs no derived spec: the gate asks about everything"
+    assert not (created[0]["agent"] or "").endswith("--readonly")
+    assert stream_mock.await_args.kwargs["approval_policy"] is ToolApprovalPolicy.READ_ONLY
+    assert "lookups work here, but changes don't" in stream_mock.await_args.args[1]

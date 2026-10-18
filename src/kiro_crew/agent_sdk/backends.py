@@ -1344,17 +1344,22 @@ ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD = frozenset({ACP_BACKEND_KIRO})
 # no kiro agent spec at all. A side turn on it therefore runs ``REJECT_ALL`` until a
 # read-only posture is expressed in the harness's own permission vocabulary.
 #
-# pi is NOT a member either. Every one of its tool calls does reach
-# ``session/request_permission``, but through Crew's gate extension rather than the
-# derived spec, and the extension expresses no read-only posture -- it asks about
-# everything and lets the host decide.
+# pi IS a member: every one of its tool calls reaches ``session/request_permission``
+# through Crew's gate extension, which asks about everything (no pre-approval
+# bypass exists, so no derived spec is needed -- unlike kiro-cli, whose grants
+# the ``<agent>--readonly`` spec must empty). The READ_ONLY posture is expressed
+# in the host gate: the envelope's tool name is substituted as the trusted
+# builtin identity (``acp/_dispatch``), and ``hooks`` auto-approves pi's
+# read-only builtins (read/grep/find/ls, read-only bash) while rejecting the
+# rest. A side turn on pi therefore runs READ_ONLY directly under the resolved
+# agent (``dashboard/handlers/side``), with a SEL row per decision.
 # deepseek is NOT a member, and the tempting part is that its permission vocabulary
 # HAS a read-only posture Crew can select with ``DSH_PERMISSION_MODE``. Selecting it
 # would confine the harness and still not produce a READ_ONLY DECISION anyone can
 # see: that posture is enforced by the harness's own sandbox, which denies rather
 # than asks, so no call reaches the host gate and no SEL row is written. A side turn
 # on it runs ``REJECT_ALL``.
-ACP_BACKENDS_SIDE_READONLY = frozenset({ACP_BACKEND_KIRO})
+ACP_BACKENDS_SIDE_READONLY = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_PI})
 
 # Backends whose model-side REFUSAL arrives with a structured reason, not just a
 # stop reason. When the Kiro service's content filter declines a turn, kiro-cli
