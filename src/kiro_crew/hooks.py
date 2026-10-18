@@ -1417,9 +1417,17 @@ class HookManager:
                 # on the permission event (``readOnlyHint`` is a manifest claim
                 # nothing forwards to the gate), so it is not provable here and
                 # falls to the caller's path, which under READ_ONLY refuses.
-                if kind and kind not in _READ_ONLY_TOOL_KINDS:
+                # "search" reaches the builtin check but never auto-approves on
+                # kind alone: pi's grep/find/ls report it (host-authored via the
+                # gate envelope's KIND_BY_TOOL), and the builtin name below must
+                # still agree. Every other non-read kind refuses here.
+                if kind and kind not in (_READ_ONLY_TOOL_KINDS | frozenset({"search"})):
                     return ToolHookResult.allow()
                 if _is_host_read_only_builtin(
+                    mcp_tool_name, mcp_server_name, mcp_identity_trusted=mcp_identity_trusted
+                ):
+                    return ToolHookResult.auto_approve(read_only=True)
+                if _is_pi_gate_read_only_tool(
                     mcp_tool_name, mcp_server_name, mcp_identity_trusted=mcp_identity_trusted
                 ):
                     return ToolHookResult.auto_approve(read_only=True)
@@ -1529,6 +1537,18 @@ _HOST_READ_ONLY_BUILTIN_TOOLS: frozenset[str] = frozenset(
     {"fs_read", "glob", "grep", "web_fetch", "web_search"}
 )
 
+# Pi gate-extension tools the host knows to be read-only, keyed by the harness's
+# own tool name as carried in the gate envelope (``acp/_dispatch.gate_envelope``)
+# and substituted as the trusted builtin identity on the permission event. The
+# pi extension asks about EVERY tool call, so unlike the kiro derived-spec
+# allowance there is no bypass to close: every call reaches the gate, and this
+# set decides which ones the READ_ONLY policy may auto-approve. ``read`` reads a
+# file, ``grep``/``find``/``ls`` search or list without writing; ``write``,
+# ``edit`` and ``bash`` (via the shell branch, judged by ``is_read_only_bash``)
+# never match here. Provenance requirements mirror ``_is_host_read_only_builtin``:
+# trusted envelope identity, no server behind it.
+_PI_GATE_READ_ONLY_TOOLS: frozenset[str] = frozenset({"read", "grep", "find", "ls"})
+
 
 def _is_host_read_only_builtin(
     mcp_tool_name: str, mcp_server_name: str, *, mcp_identity_trusted: bool
@@ -1566,6 +1586,25 @@ def _is_host_read_only_builtin(
     if mcp_server_name or not mcp_tool_name:
         return False
     return mcp_tool_name in _HOST_READ_ONLY_BUILTIN_TOOLS
+
+
+def _is_pi_gate_read_only_tool(
+    mcp_tool_name: str, mcp_server_name: str, *, mcp_identity_trusted: bool
+) -> bool:
+    """True when the trusted gate-envelope identity names a pi read-only tool.
+
+    Same provenance contract as :func:`_is_host_read_only_builtin`: the name must
+    come from the nonce-verified gate envelope (``acp/_dispatch`` substitutes it
+    as the trusted builtin identity), with no server behind it. Only pi's
+    read-only builtins match -- ``write``/``edit`` never do, and ``bash`` is
+    judged by the shell branch (``is_read_only_bash`` on the recovered command),
+    never here.
+    """
+    if not mcp_identity_trusted:
+        return False
+    if mcp_server_name or not mcp_tool_name:
+        return False
+    return mcp_tool_name in _PI_GATE_READ_ONLY_TOOLS
 
 
 # Semantic kinds known to mutate/execute. DOCUMENTATION ONLY — the gate does not
