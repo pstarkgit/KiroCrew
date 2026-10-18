@@ -1569,6 +1569,138 @@ class TestClassifierOnlyHostTrustedProof:
             assert _is_host_read_only_builtin(name, "", mcp_identity_trusted=True) is False, name
 
 
+class TestPiGateReadOnlyProof:
+    """Pi's read-only builtins are proven by the gate-envelope identity.
+
+    The names are pi's own tool vocabulary (``read``/``grep``/``find``/``ls``),
+    trusted only via the nonce-verified envelope ``acp/_dispatch`` substitutes
+    as the builtin identity -- never via the model-authored title or the
+    agent-influenced kind. ``write``/``edit`` never match; ``bash`` is judged
+    by the shell branch (``is_read_only_bash`` on the recovered command), never
+    here.
+    """
+
+    def test_pi_read_only_tools_are_proven(self):
+        from kiro_crew.hooks import _is_pi_gate_read_only_tool
+
+        for name in ("read", "grep", "find", "ls"):
+            assert (
+                _is_pi_gate_read_only_tool(name, "", mcp_identity_trusted=True) is True
+            ), name
+
+    def test_pi_writes_and_shell_are_not_a_read_proof(self):
+        from kiro_crew.hooks import _is_pi_gate_read_only_tool
+
+        for name in ("write", "edit", "bash", "fs_read", ""):
+            assert (
+                _is_pi_gate_read_only_tool(name, "", mcp_identity_trusted=True) is False
+            ), name
+
+    def test_pi_proof_needs_trusted_provenance_and_no_server(self):
+        from kiro_crew.hooks import _is_pi_gate_read_only_tool
+
+        assert _is_pi_gate_read_only_tool("read", "", mcp_identity_trusted=False) is False
+        assert (
+            _is_pi_gate_read_only_tool("read", "evil-server", mcp_identity_trusted=True)
+            is False
+        )
+
+    def test_pi_read_is_auto_approved_classifier_only(self):
+        from kiro_crew.hooks import TOOL_AUTO_APPROVE, HookManager
+
+        gate = HookManager()
+        result = gate.on_tool_call(
+            "read",
+            session_key="side:parent",
+            agent="kirocrew",
+            tool_kind="read",
+            raw_params={"path": "notes.txt"},
+            mcp_tool_name="read",
+            mcp_identity_trusted=True,
+            classifier_only=True,
+        )
+        assert result.action == TOOL_AUTO_APPROVE and result.read_only
+
+    def test_pi_search_kind_reaches_the_builtin_check(self):
+        """``search`` is pi's host-authored kind for grep/find/ls: it must reach
+        the builtin name check rather than refuse outright -- while proving
+        nothing on its own (an unknown search tool still falls through, which
+        the READ_ONLY caller refuses)."""
+        from kiro_crew.hooks import TOOL_AUTO_APPROVE, HookManager
+
+        gate = HookManager()
+        approved = gate.on_tool_call(
+            "grep",
+            session_key="side:parent",
+            agent="kirocrew",
+            tool_kind="search",
+            raw_params={"pattern": "TODO", "path": "src"},
+            mcp_tool_name="grep",
+            mcp_identity_trusted=True,
+            classifier_only=True,
+        )
+        assert approved.action == TOOL_AUTO_APPROVE and approved.read_only
+
+        unknown = gate.on_tool_call(
+            "mystery-search",
+            session_key="side:parent",
+            agent="kirocrew",
+            tool_kind="search",
+            mcp_tool_name="mystery-search",
+            mcp_identity_trusted=True,
+            classifier_only=True,
+        )
+        assert not (unknown.action == TOOL_AUTO_APPROVE and unknown.read_only)
+
+    def test_pi_write_and_mutating_bash_are_not_auto_approved(self):
+        from kiro_crew.hooks import TOOL_AUTO_APPROVE, HookManager
+
+        gate = HookManager()
+        write = gate.on_tool_call(
+            "write",
+            session_key="side:parent",
+            agent="kirocrew",
+            tool_kind="edit",
+            raw_params={"path": "notes.txt", "content": "x"},
+            mcp_tool_name="write",
+            mcp_identity_trusted=True,
+            classifier_only=True,
+        )
+        assert not (write.action == TOOL_AUTO_APPROVE and write.read_only)
+
+        rm = gate.on_tool_call(
+            "bash",
+            session_key="side:parent",
+            agent="kirocrew",
+            tool_kind="execute",
+            command="rm -rf /tmp/x",
+            raw_params={"command": "rm -rf /tmp/x"},
+            is_shell=True,
+            mcp_tool_name="bash",
+            mcp_identity_trusted=True,
+            classifier_only=True,
+        )
+        assert not (rm.action == TOOL_AUTO_APPROVE and rm.read_only)
+
+    def test_pi_read_only_bash_is_auto_approved(self):
+        from kiro_crew.hooks import TOOL_AUTO_APPROVE, HookManager
+
+        gate = HookManager()
+        result = gate.on_tool_call(
+            "bash",
+            session_key="side:parent",
+            agent="kirocrew",
+            tool_kind="execute",
+            command="echo gate-check",
+            raw_params={"command": "echo gate-check"},
+            is_shell=True,
+            mcp_tool_name="bash",
+            mcp_identity_trusted=True,
+            classifier_only=True,
+        )
+        assert result.action == TOOL_AUTO_APPROVE and result.read_only
+
+
 class TestMutatingKindBeatsTheTitle:
     """Only an explicitly READ-ONLY ``tool_kind`` may auto-approve on a title.
 

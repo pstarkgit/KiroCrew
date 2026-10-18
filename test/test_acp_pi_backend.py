@@ -1050,6 +1050,55 @@ class TestGateEnvelope:
         assert gate_envelope({"rawInput": raw}, "") is None
 
 
+class TestGateEnvelopeIdentity:
+    """A verified envelope substitutes the harness's tool name as trusted identity.
+
+    Pi stamps no ``_meta`` identity, so without this the caches carry ``""``/
+    ``""`` and the READ_ONLY builtin check reads "identifies nothing". The
+    envelope's title (nonce-verified, dialog-title-bound) is the harness's own
+    tool name with the same provenance as the cached kind -- so it becomes the
+    trusted builtin identity with no server behind it. Whether that name is
+    READ-ONLY is the host gate's decision (``hooks``), never this builder's.
+    """
+
+    def test_a_read_envelope_carries_a_trusted_builtin_identity(self):
+        event, _ = _build(
+            _permission_frame(
+                _envelope(tool="read", kind="read", input={"path": "a.txt"}), title="read"
+            )
+        )
+        assert event.tool_name == "read"
+        assert event.mcp_server_name == ""
+        assert event.mcp_identity_trusted is True
+
+    def test_a_write_envelope_is_trusted_identity_but_not_a_read_proof(self):
+        """Identity and verdict are separate layers: dispatch trusts the name,
+        hooks refuses the write. Pinning only one would let a refactor move the
+        verdict into the parser (fail-open) or drop the identity (fail-closed
+        for reads) with no red test."""
+        event, _ = _build(
+            _permission_frame(
+                _envelope(tool="write", kind="edit", input={"path": "a.txt", "content": "x"}),
+                title="write",
+            )
+        )
+        assert event.tool_name == "write"
+        assert event.mcp_identity_trusted is True
+
+    def test_a_dialog_without_an_envelope_carries_no_identity(self):
+        event, _ = _build(_permission_frame("Allow rm -rf?", title="Dangerous!"))
+        assert event.tool_name == ""
+        assert event.mcp_identity_trusted is False
+
+    def test_a_forged_envelope_carries_no_identity(self):
+        """No nonce (a harness without the gate extension) means the message is
+        never consulted -- the marker alone proves nothing, or any model's
+        ``{method: "confirm", message: <envelope>}`` would mint trusted identity."""
+        event, _ = build_permission_event(_permission_frame(_envelope()))
+        assert event.tool_name == ""
+        assert event.mcp_identity_trusted is False
+
+
 # ── Live, when both components are installed ────────────────────────────────
 
 
